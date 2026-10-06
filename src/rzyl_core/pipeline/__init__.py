@@ -1,7 +1,8 @@
-"""核心流水线：采集缓冲、窗口组装、提取、去重、入库。
+"""核心流水线：采集缓冲、窗口组装、提取、去重、入库、历史来源。
 
 工单 #4 交付**窗口组装**（``rzyl_core.pipeline.window``）；工单 #7 交付**提取入库**
-（``rzyl_core.pipeline.extract``）。对外只暴露这两个模块里的公开名字。
+（``rzyl_core.pipeline.extract``）；工单 #5 追加**历史来源**（``rzyl_core.pipeline.history``）
+与 dry-run 的 ``PreviewOutcome``。
 
     from rzyl_core.pipeline import WindowAssembler, ExtractionPipeline
 """
@@ -15,10 +16,21 @@ from rzyl_core.pipeline.extract import (
     ExtractionOutcome,
     ExtractionParseError,
     ExtractionPipeline,
+    PreviewOutcome,
     cosine_similarity,
     dedupe_hash,
     normalize_statement,
     parse_extraction,
+)
+from rzyl_core.pipeline.history import (
+    GROUP_MESSAGE_HISTORY_ACTION,
+    HistoryFetchError,
+    HistoryMessage,
+    HistorySource,
+    OneBotHistorySource,
+    SampleHistorySource,
+    message_dedupe_hash,
+    render_message_segments,
 )
 from rzyl_core.pipeline.window import (
     DEFAULT_PREVIOUS_TAIL_SIZE,
@@ -37,8 +49,15 @@ from rzyl_core.pipeline.window import (
 __all__ = [
     "DEFAULT_PREVIOUS_TAIL_SIZE",
     "DEFAULT_REMEMBERED_LIMIT",
+    "GROUP_MESSAGE_HISTORY_ACTION",
+    "HistoryFetchError",
+    "HistoryMessage",
+    "HistorySource",
     "LLM_PURPOSE",
+    "OneBotHistorySource",
     "PREVIOUS_TAIL_HEADER",
+    "PreviewOutcome",
+    "SampleHistorySource",
     "AssembledWindow",
     "ExtractedMemory",
     "ExtractedPersonRef",
@@ -52,8 +71,10 @@ __all__ = [
     "assemble_window",
     "cosine_similarity",
     "dedupe_hash",
+    "message_dedupe_hash",
     "normalize_statement",
     "parse_extraction",
+    "render_message_segments",
     "sender_name",
     "summarize_memories",
 ]

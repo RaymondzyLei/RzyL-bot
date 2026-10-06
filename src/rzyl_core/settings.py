@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///data/rzyl.db"
     """SQLite 连接串。默认落在宿主机的 ``data/`` 目录，便于备份与手工查询。"""
 
+    # —— OneBot 历史拉取（回放 / 里程碑 2 的掉线回补用）——
+    onebot_api_root: str = ""
+    """OneBot（NapCat）的 HTTP API 根地址，例如 ``http://127.0.0.1:3000``。
+
+    默认空，表示本机没有可用的 OneBot HTTP 端点——此时只有样本文件那条回放路径可用。
+    """
+
+    onebot_access_token: str = ""
+    """OneBot HTTP API 的 Bearer token；默认空。"""
+
     # —— 聊天模型 ——
     chat_base_url: str = "https://api.deepseek.com/v1"
     chat_model: str = "deepseek-chat"

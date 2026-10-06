@@ -1,0 +1,74 @@
+[
+  {
+    "group_id": 100200300,
+    "user_id": 10001,
+    "nickname": "小A",
+    "card": "阿A",
+    "sent_at": "2026-10-07T09:00:00+08:00",
+    "platform_message_id": 900001,
+    "text": "大家看下这个网盘链接 https://pan.example.com/s/abc123 里面是实验讲义"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10002,
+    "nickname": "小B",
+    "card": null,
+    "sent_at": "2026-10-07T09:01:00+08:00",
+    "platform_message_id": 900002,
+    "text": "收到，谢谢"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10001,
+    "nickname": "小A",
+    "card": "阿A",
+    "sent_at": "2026-10-07T09:02:00+08:00",
+    "platform_message_id": 900003,
+    "text": "总结一下：实验课改到周五下午三点，地点还是老地方"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10003,
+    "nickname": "小C",
+    "card": null,
+    "sent_at": "2026-10-07T09:03:00+08:00",
+    "platform_message_id": 900004,
+    "text": "求一份上周的数据集，有人有吗"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10002,
+    "nickname": "小B",
+    "card": null,
+    "sent_at": "2026-10-07T09:05:00+08:00",
+    "platform_message_id": 900005,
+    "text": "我发你，稍等"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10004,
+    "nickname": "小D",
+    "card": "D同学",
+    "sent_at": "2026-10-07T09:20:00+08:00",
+    "platform_message_id": 900006,
+    "text": "论文《关于群聊记忆的若干问题》在这里 https://arxiv.org/abs/1234.5678"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10003,
+    "nickname": "小C",
+    "card": null,
+    "sent_at": "2026-10-07T09:21:00+08:00",
+    "platform_message_id": 900007,
+    "text": "收藏了"
+  },
+  {
+    "group_id": 100200300,
+    "user_id": 10001,
+    "nickname": "小A",
+    "card": "阿A",
+    "sent_at": "2026-10-07T09:22:00+08:00",
+    "platform_message_id": 900008,
+    "text": "另外考试范围老师说是前三章"
+  }
+]

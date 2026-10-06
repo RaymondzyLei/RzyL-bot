@@ -1,6 +1,6 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["src", "tests", "plugins", "bot.py"],
+  "include": ["src", "tests", "scripts", "plugins", "bot.py"],
   "exclude": ["**/__pycache__", ".venv", "data"]
 }
