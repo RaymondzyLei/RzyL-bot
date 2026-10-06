@@ -16,8 +16,10 @@ from rzyl_core.llm.chat import ChatModel, ChatResult, ChatUsage
 from rzyl_core.llm.embedding import (
     DeterministicEmbedding,
     Embedding,
+    EmbeddingBatch,
     EmbeddingModel,
     NullEmbedding,
+    embed_batch,
 )
 from rzyl_core.llm.errors import (
     LLMError,
@@ -48,6 +50,7 @@ __all__ = [
     "DeterministicEmbedding",
     "EchoChatModel",
     "Embedding",
+    "EmbeddingBatch",
     "EmbeddingModel",
     "FakeChatModel",
     "LLMError",
@@ -63,5 +66,6 @@ __all__ = [
     "ReceivedPrompt",
     "RenderedPrompt",
     "current_prompt_version",
+    "embed_batch",
     "get_prompt_template",
 ]

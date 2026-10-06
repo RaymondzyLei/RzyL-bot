@@ -32,7 +32,11 @@ def _settings(**overrides: object) -> Settings:
 
 
 class _Clock:
-    """壁钟停在很远以后：回放若不换成「跟着消息走」的时钟，历史消息会瞬间全部成窗。"""
+    """壁钟停在很远以后，用来证明成窗不看注入时钟、只看消息自身的时间。
+
+    旧实现拿「当下时钟 − 缓冲首条时间」判超时，壁钟停在未来会让历史消息瞬间全部成窗；
+    现在成窗只看消息自身的 ``sent_at``，这个时钟再怎么偏都不影响切窗。
+    """
 
     def __init__(self, now: datetime) -> None:
         self.now = now
@@ -80,7 +84,7 @@ async def test_replay_over_the_sample_history_persists_entries(tmp_path: Path) -
 
 
 async def test_replay_windows_by_the_replayed_timeline_not_the_wall_clock(tmp_path: Path) -> None:
-    """回放时钟跟着每条消息走：09:20 那条把前一段 09:03–09:05 顶成一个窗口。"""
+    """成窗跟着回放时间线（消息自身时间）走：09:20 那条把前一段 09:03–09:05 顶成一个窗口。"""
     runtime = await _runtime(tmp_path)
     try:
         report = await runtime.replay(source=SampleHistorySource(SAMPLE), group_id=GROUP)

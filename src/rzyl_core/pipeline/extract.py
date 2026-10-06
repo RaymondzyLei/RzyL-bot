@@ -54,6 +54,7 @@ from rzyl_core.llm import (
     ChatUsage,
     EmbeddingModel,
     LLMError,
+    embed_batch,
 )
 from rzyl_core.llm.prompts import RenderedPrompt
 from rzyl_core.pipeline.window import AssembledWindow, UnknownSequenceError
@@ -459,7 +460,7 @@ class ExtractionPipeline:
     ) -> ExtractionOutcome:
         """两层去重、算向量、组装 ``Memory``，最后一个事务写库。"""
         candidates = await self._repository.list_group_memories(
-            group_id=window.group_id, include_expired=True
+            group_id=window.group_id, include_inactive=True
         )
         existing_by_id = {int(candidate.id): candidate for candidate in candidates}
         blocked_hashes = {
@@ -579,16 +580,16 @@ class ExtractionPipeline:
         )
 
     async def _embed(self, texts: Sequence[str]) -> list[list[float] | None]:
-        """批量算向量；拿不到（空实现、服务异常、数量不符）就整批留空，绝不因此失败。"""
+        """批量算向量；拿不到（空实现、服务异常、数量不符）就整批留空，绝不因此失败。
+
+        容错逻辑与 Runtime 的向量补算共用 :func:`rzyl_core.llm.embed_batch`。
+        """
         if not texts:
             return []
-        try:
-            vectors = await self._embedding.embed(texts)
-        except Exception:  # 向量服务抖动不应阻塞提取
+        batch = await embed_batch(self._embedding, texts)
+        if batch.vectors is None:
             return [None] * len(texts)
-        if vectors is None or len(vectors) != len(texts):
-            return [None] * len(texts)
-        return [list(vector) if vector else None for vector in vectors]
+        return batch.vectors
 
 
 __all__ = [

@@ -8,8 +8,11 @@
    摘要里带 ``[#编号]``，模型的 ``supersedes`` 引用的就是它。
 3. **本窗口消息**——每条带**窗口内序号**（1 起），模型的 ``evidence`` 引用的就是序号。
 
-成窗规则：**条数或时间先到者**，每个群各自独立缓冲。时间一律从注入的时钟读，
-测试可以手动推进，不必真等 5 分钟。
+成窗规则：**条数或时间先到者**，每个群各自独立缓冲。时间判定看的是**消息自己的**
+``sent_at``：新消息与缓冲首条的时间跨度达到上限就把缓冲关成窗口，这条新消息属于下一个
+窗口。这样实时链路、离线回放与里程碑 2 的掉线回补（用当下时钟灌一批历史消息）三条路径
+都正确，回放也不必再「把时钟拨到消息时间」。只有 :meth:`WindowAssembler.flush_expired`
+在无人再来消息时用注入时钟判断缓冲是否已跨过窗口——那时拿当下时钟比是对的。
 
 给下游的契约（#7 提取入库要接）：
 
@@ -58,10 +61,20 @@ def sender_name(*, user_id: int, nickname: str | None, card: str | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class WindowMessage:
-    """进入窗口组装的一条消息（组装器的输入单元）。
+    """进入窗口组装的一条消息（组装器的**输入单元**，尚未成窗）。
 
-    ``message_id`` 是它在 ``message`` 表里的自增编号，也就是「真实消息编号」——
-    #7 把模型引用的窗口内序号换回的就是它。
+    与 :class:`SequencedMessage` 的区别看「输入 / 输出」：本类是刚进缓冲的一条消息，
+    只认数据库里的真实编号；:class:`SequencedMessage` 是**已成窗后窗口里的一行**，
+    额外带窗口内序号。两者名字都像「窗口里的消息」，故在此点明。
+
+    三个容易混的编号一次说清：
+
+    - ``message_id``：``message`` 表的自增主键，即**真实消息编号**，全局唯一、不重用；
+      #7 把模型引用的窗口内序号换回的就是它。
+    - ``platform_message_id``：QQ / OneBot 的平台短 ID，只作参考，重启即失效，**不可**
+      当长期标识（见 issue #1）。
+    - ``message_seq``：OneBot ``get_group_msg_history`` 的翻页锚，只在历史来源里有值
+      （见 :class:`~rzyl_core.pipeline.history.HistoryMessage`），也不当长期标识。
 
     仓储层的 :class:`~rzyl_core.db.models.Message` 用 :meth:`from_message` 适配；
     :meth:`WindowAssembler.add` 也直接收 ORM 对象，内部会自动适配。
@@ -107,11 +120,15 @@ def _as_window_message(message: "WindowMessage | Message") -> WindowMessage:
 
 @dataclass(frozen=True, slots=True)
 class SequencedMessage:
-    """窗口里的一条消息。
+    """窗口里的一条消息（**已成窗**后窗口里的一行，组装器的输出）。
 
     ``sequence`` 是它在**本窗口**里的序号（1 起），也是提示词里给模型引用的编号。
     对上一窗口尾部而言，``sequence`` 是它在前一个窗口里的序号，仅信息性，
     **不可被 ``evidence`` 引用**。
+
+    ``message_id`` 是真实消息编号（``message`` 表主键），语义与
+    :attr:`WindowMessage.message_id` 完全一致；它**不是**平台短 ID，也不是翻页锚
+    （后两者的区别见 :class:`WindowMessage` 的说明）。
     """
 
     sequence: int
@@ -262,7 +279,8 @@ def summarize_memories(memories: Sequence[Memory]) -> str:
 class WindowAssembler:
     """按群独立缓冲消息，攒满条数或到点就成窗。
 
-    构造时注入仓储、时钟与设置：时间源可替换，所以测试能手动推进而不用真等。
+    构造时注入仓储、时钟与设置。时钟只供 :meth:`flush_expired`（群里没人说话时收尾）
+    使用；:meth:`add` 的成窗时间判定完全基于消息自身的 ``sent_at``，与注入时钟无关。
 
         assembler = WindowAssembler(repository=repo, clock=clock, settings=settings)
         for message in stream:
@@ -309,15 +327,16 @@ class WindowAssembler:
 
         可直接传仓储的 ``Message``（内部会适配），也可传 :class:`WindowMessage`。
 
-        若该群上一个窗口已到时间上限，先把它关掉再收这条消息——**先到者成窗**，
-        新消息属于下一个窗口。
+        若这条消息与缓冲首条的时间跨度已达窗口上限，先把已有缓冲关掉再收这条——
+        **先到者成窗**，新消息属于下一个窗口。判定只看消息自身的 ``sent_at``，
+        不看注入时钟，所以回放与掉线回补灌历史消息时也能正确切窗。
         """
         normalized = _as_window_message(message)
         group_id = normalized.group_id
         buffer = self._buffers.setdefault(group_id, [])
         windows: list[AssembledWindow] = []
 
-        if buffer and self._clock() - buffer[0].sent_at >= self._span:
+        if buffer and normalized.sent_at - buffer[0].sent_at >= self._span:
             windows.append(await self._close(group_id, buffer))
             buffer = self._buffers[group_id] = []
 
