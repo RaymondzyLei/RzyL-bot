@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 本地配置与密钥：提交 .env.example，不要提交 .env
+.env
+.env.*
+!.env.example
+
+# NapCat 运行时生成的配置（含 WebUI token、机器人 QQ 号）
+# 目录本身要保留：容器 bind mount 需要它存在且属主为 NAPCAT_UID
+napcat/config/*
+!napcat/config/.gitkeep

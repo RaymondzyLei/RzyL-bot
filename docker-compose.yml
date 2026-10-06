@@ -1,0 +1,62 @@
+# RzyL-bot：NoneBot2 机器人 + NapCatQQ
+#
+# 拓扑：napcat 容器主动连 nonebot 容器的 /onebot/v11/ws（OneBot v11 反向 WebSocket）
+# NapCat 镜像内置的 nonebot.json 模板里写死了 ws://nonebot:8080/onebot/v11/ws，
+# 所以机器人服务名必须是 nonebot、端口必须是 8080，别改。
+#
+# 首次启动：
+#   docker compose up -d
+#   docker compose logs napcat          # 查看 WebUI token
+#   浏览器打开 http://127.0.0.1:6099/webui 扫码登录 QQ
+# 登录完成后 NapCat 会按模板自动建立反向 WS，机器人日志里会出现连接记录。
+
+services:
+  nonebot:
+    build: .
+    image: rzyl-bot:latest
+    container_name: rzyl-bot
+    restart: unless-stopped
+    environment:
+      DRIVER: "~fastapi"
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      # 空串代表命令无需前缀，直接发「大雾1 关键词」即可
+      COMMAND_START: '[""]'
+      COMMAND_SEP: '[""]'
+      # 容器内没有 TTY，关掉 console 适配器
+      ENABLE_CONSOLE_ADAPTER: "false"
+      TZ: Asia/Shanghai
+    networks: [rzyl]
+    # 故意不发布 8080：/onebot/v11/ws 目前没开鉴权，只让容器网络内可达。
+    # 需要从宿主机看离线文档或调试时，临时加上：
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    depends_on: [nonebot]
+    environment:
+      NAPCAT_UID: ${NAPCAT_UID:-1000}
+      NAPCAT_GID: ${NAPCAT_GID:-1000}
+      # 用镜像内置模板生成 napcat/config/onebot11.json（反向 WS 指向 nonebot:8080）
+      MODE: nonebot
+      # WebUI 登录令牌，在项目 .env 里改
+      WEBUI_TOKEN: ${WEBUI_TOKEN:-napcat-local}
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:6099:6099" # WebUI（扫码登录用），只绑本机
+    volumes:
+      - ./napcat/config:/app/napcat/config # 配置，便于查看/备份（目录属主需为 NAPCAT_UID）
+      - napcat-qq:/app/.config/QQ # QQ 登录态，用命名卷避开权限问题
+    networks: [rzyl]
+    # QQ 风控较严时可固定 MAC（NapCat 官方示例里也有这段）：
+    # mac_address: "02:42:ac:11:00:02"
+
+networks:
+  rzyl:
+    driver: bridge
+
+volumes:
+  napcat-qq:

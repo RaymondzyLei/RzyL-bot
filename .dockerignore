@@ -1,0 +1,20 @@
+.git
+.github
+.venv
+__pycache__/
+*.py[oc]
+*.egg-info
+build/
+dist/
+
+# 配置与密钥：容器里通过 compose 的 environment 注入，不要打进镜像
+.env
+.env.*
+
+# 容器自身的描述文件，构建时不需要
+Dockerfile
+.dockerignore
+docker-compose.yml
+compose.yaml
+
+# 注意：不要忽略 README.md —— pyproject 里的 readme 字段指向它，构建项目元数据时要用
