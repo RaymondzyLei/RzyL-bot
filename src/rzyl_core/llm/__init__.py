@@ -25,7 +25,7 @@ from rzyl_core.llm.errors import (
     LLMResponseError,
     LLMTimeoutError,
 )
-from rzyl_core.llm.fakes import FakeChatModel, ReceivedPrompt
+from rzyl_core.llm.fakes import EchoChatModel, FakeChatModel, ReceivedPrompt
 from rzyl_core.llm.openai_compat import (
     OpenAICompatChatClient,
     OpenAICompatEmbeddingClient,
@@ -46,6 +46,7 @@ __all__ = [
     "ChatUsage",
     "DEFAULT_PROMPT_VERSION",
     "DeterministicEmbedding",
+    "EchoChatModel",
     "Embedding",
     "EmbeddingModel",
     "FakeChatModel",

@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from .engine import open_engine
@@ -448,3 +448,63 @@ class Repository:
                 .order_by(GroupSetting.group_id)
             )
             return list(result.scalars().all())
+
+    # —— 原文消息的读与清理（以下为工单 #5 追加）——
+
+    async def list_messages(
+        self, *, group_id: int | None = None, limit: int = 100
+    ) -> list[Message]:
+        """取原文消息，按发送时间升序（同刻按编号升序）。
+
+        回放脚本与保留期清理的验收都靠它把「库里现在有什么」读回来；按群过滤时
+        就是该群的一份时间线。
+        """
+        statement = select(Message)
+        if group_id is not None:
+            statement = statement.where(Message.group_id == group_id)
+        statement = statement.order_by(Message.sent_at, Message.id).limit(limit)
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
+    async def delete_messages_before(self, cutoff: datetime) -> int:
+        """删掉 ``sent_at`` 严格早于 ``cutoff`` 的原文消息，返回删除条数。
+
+        只删原文，不动记忆条目——原文滚动保留、结论永久，这是 issue #1 的保留策略。
+        注意 ``message`` 上没有外键指向它的行（``memory.evidence`` 存的是编号数组而非
+        外键），所以这里删得干净，不需要级联。
+        """
+        async with self._sessions() as session:
+            result = await session.execute(delete(Message).where(Message.sent_at < cutoff))
+            await session.commit()
+            # DELETE 返回的是 CursorResult，但公共签名里只有 Result，故用 getattr 取 rowcount。
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    # —— 向量补算（以下为工单 #5 追加）——
+
+    async def list_memories_missing_embedding(self, *, limit: int = 100) -> list[Memory]:
+        """取还没算向量的记忆条目（向量为空或空字节串），按编号升序。
+
+        后台补算任务据此分批取活干；只认 ``active`` / ``suspect_duplicate``，已过期
+        的条目不再补算。
+        """
+        statement = (
+            select(Memory)
+            .where(Memory.status != MemoryStatus.EXPIRED)
+            .where(or_(Memory.embedding.is_(None), func.length(Memory.embedding) == 0))
+            .order_by(Memory.id)
+            .limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
+    async def update_memory_embedding(self, memory_id: int, embedding: Sequence[float]) -> bool:
+        """把补算出的向量写回某条记忆；条目不存在返回 ``False``。"""
+        async with self._sessions() as session:
+            memory = await session.get(Memory, memory_id)
+            if memory is None:
+                return False
+            memory.embedding = encode_vector(list(embedding))
+            await session.commit()
+            return True

@@ -55,6 +55,7 @@ from rzyl_core.llm import (
     EmbeddingModel,
     LLMError,
 )
+from rzyl_core.llm.prompts import RenderedPrompt
 from rzyl_core.pipeline.window import AssembledWindow, UnknownSequenceError
 from rzyl_core.settings import Settings
 
@@ -191,6 +192,26 @@ class ExtractionOutcome:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PreviewOutcome:
+    """一次 :meth:`ExtractionPipeline.preview_window` 的结果：``--dry-run`` 的产物。
+
+    - ``rendered`` 是**完整提示词**（版本号 + 系统提示词 + 用户内容），原样可打印；
+    - ``raw_output`` 是模型的**原始输出文本**（未做任何清洗）；调用失败时为 ``None``；
+    - ``items`` 是校验通过的条目（与正常模式同一套 pydantic 校验与依据换号）；
+    - ``error`` 是调用失败或格式错误的原因，正常时为 ``None``。
+
+    这个结果**不代表任何库写入**——preview 全程不落库，所以库不会出现窗口行或条目。
+    """
+
+    rendered: RenderedPrompt
+    raw_output: str | None
+    items: tuple[ExtractedMemory, ...]
+    error: str | None
+    usage: ChatUsage | None = None
+    model: str | None = None
+
+
 def _tzinfo(name: str):
     """把设置里的时区名解析成 tzinfo；认不出来就退回 UTC，不因此中断提取。"""
     try:
@@ -301,6 +322,49 @@ class ExtractionPipeline:
             status=WindowStatus.DEAD,
             attempts=attempts,
             error=dead_error,
+        )
+
+    async def preview_window(self, window: AssembledWindow) -> PreviewOutcome:
+        """渲染提示词、调一次模型、校验输出，但**全程不碰任何库**（``--dry-run``）。
+
+        与 :meth:`process_window` 共用 ``window.render()`` 与 :meth:`_resolve` 这套渲染 /
+        校验代码，差别只有两点：只调模型一次、不重试；以及不建窗口行、不写条目、不记账。
+        因此它既不会把半个窗口的条目写进库，也不会注册任何 llm_call。
+
+        模型调用失败时 ``raw_output`` 为 ``None``；输出不合格式时 ``raw_output`` 是原始
+        文本、``error`` 是原因——两种情况都原样返回，不抛异常，方便回放脚本打印。
+        """
+        rendered = window.render()
+        try:
+            result = await self._chat.complete(rendered.system, rendered.user)
+        except LLMError as exc:
+            return PreviewOutcome(
+                rendered=rendered,
+                raw_output=None,
+                items=(),
+                error=f"模型调用失败：{exc}",
+            )
+
+        try:
+            # 先按正常模式的校验走一遍（含 evidence 越界检查），失败就只报告原因。
+            self._resolve(window, result.text)
+        except ExtractionParseError as exc:
+            return PreviewOutcome(
+                rendered=rendered,
+                raw_output=result.text,
+                items=(),
+                error=str(exc),
+                usage=result.usage,
+                model=result.model,
+            )
+
+        return PreviewOutcome(
+            rendered=rendered,
+            raw_output=result.text,
+            items=tuple(parse_extraction(result.text)),
+            error=None,
+            usage=result.usage,
+            model=result.model,
         )
 
     async def _ensure_window(self, window: AssembledWindow) -> int:
@@ -534,6 +598,7 @@ __all__ = [
     "ExtractionOutcome",
     "ExtractionParseError",
     "ExtractionPipeline",
+    "PreviewOutcome",
     "cosine_similarity",
     "dedupe_hash",
     "normalize_statement",

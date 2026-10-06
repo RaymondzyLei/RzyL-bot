@@ -14,3 +14,9 @@
 
 设计见 https://github.com/RaymondzyLei/RzyL-bot/issues/1
 """
+
+from __future__ import annotations
+
+from rzyl_core.runtime import IngestResult, ReplayReport, Runtime
+
+__all__ = ["IngestResult", "ReplayReport", "Runtime"]
