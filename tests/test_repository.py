@@ -234,6 +234,72 @@ async def test_search_filters_by_time_range(repo: Repository) -> None:
     assert old.id not in {m.id for m in hits}
 
 
+async def test_search_memories_excludes_inactive_entries_by_default(repo: Repository) -> None:
+    """故事 22：被判为过期 / 疑似重复的条目默认退出检索，显式开关才取回。"""
+    active = await repo.add_memory(
+        group_id=111,
+        category=Category.KNOWLEDGE,
+        statement="分布式系统仍然有效的结论",
+        confidence=0.9,
+        prompt_version="extract-v1",
+    )
+    expired = await repo.add_memory(
+        group_id=111,
+        category=Category.KNOWLEDGE,
+        statement="分布式系统的旧结论已被推翻",
+        confidence=0.9,
+        prompt_version="extract-v1",
+        status=MemoryStatus.EXPIRED,
+    )
+    suspect = await repo.add_memory(
+        group_id=111,
+        category=Category.KNOWLEDGE,
+        statement="分布式系统的疑似重复结论",
+        confidence=0.9,
+        prompt_version="extract-v1",
+        status=MemoryStatus.SUSPECT_DUPLICATE,
+    )
+
+    default = await repo.search_memories("分布式系统")
+    assert [m.id for m in default] == [active.id]
+
+    everything = await repo.search_memories("分布式系统", include_inactive=True)
+    assert {m.id for m in everything} == {active.id, expired.id, suspect.id}
+
+
+async def test_list_group_memories_excludes_inactive_by_default(repo: Repository) -> None:
+    """名字统一后语义也统一：四个读方法默认都只给 ``active``，开关一次放开全部。"""
+    active = await repo.add_memory(
+        group_id=111,
+        category=Category.EVENT,
+        statement="仍然有效的结论",
+        confidence=0.9,
+        prompt_version="extract-v1",
+    )
+    expired = await repo.add_memory(
+        group_id=111,
+        category=Category.EVENT,
+        statement="被推翻的结论",
+        confidence=0.9,
+        prompt_version="extract-v1",
+        status=MemoryStatus.EXPIRED,
+    )
+    suspect = await repo.add_memory(
+        group_id=111,
+        category=Category.EVENT,
+        statement="疑似重复的结论",
+        confidence=0.9,
+        prompt_version="extract-v1",
+        status=MemoryStatus.SUSPECT_DUPLICATE,
+    )
+
+    default = await repo.list_group_memories(group_id=111)
+    assert [m.id for m in default] == [active.id]
+
+    everything = await repo.list_group_memories(group_id=111, include_inactive=True)
+    assert {m.id for m in everything} == {active.id, expired.id, suspect.id}
+
+
 async def test_recent_memories_are_per_group_newest_first(repo: Repository) -> None:
     stamp = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
     for index in range(3):

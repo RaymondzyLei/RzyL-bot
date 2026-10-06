@@ -14,21 +14,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from rzyl_core.timeutil import utcnow
 
 from .engine import open_engine
 from .enums import Category, FeedbackKind, MemoryStatus, WindowStatus
 from .models import Feedback, GroupSetting, LlmCall, Memory, Message, PersonRef, Window
 from .schema import apply_schema
 from .vectors import decode_vector, encode_vector
-
-
-def _utcnow() -> datetime:
-    """默认时间源：当前 UTC 时刻（带时区）。"""
-    return datetime.now(timezone.utc)
 
 
 def _require_aware(value: datetime | None, field: str) -> datetime | None:
@@ -44,7 +41,7 @@ class Repository:
     def __init__(self, engine: AsyncEngine, *, clock: Callable[[], datetime] | None = None) -> None:
         self._engine = engine
         self._sessions = async_sessionmaker(engine, expire_on_commit=False)
-        self.clock: Callable[[], datetime] = clock or _utcnow
+        self.clock: Callable[[], datetime] = clock or utcnow
 
     @classmethod
     async def create(
@@ -142,13 +139,28 @@ class Repository:
             window = await session.get(Window, window_id)
             if window is None:
                 return
-            window.status = status
-            if retry_count is not None:
-                window.retry_count = retry_count
-            if error is not None:
-                window.error = error
-            window.updated_at = self.clock()
+            self._apply_window_status(window, status, retry_count=retry_count, error=error)
             await session.commit()
+
+    def _apply_window_status(
+        self,
+        window: Window,
+        status: WindowStatus,
+        *,
+        retry_count: int | None,
+        error: str | None,
+    ) -> None:
+        """把 status / retry_count / error 三字段与 ``updated_at`` 落到窗口行上。
+
+        建窗口结果（``add_window_result``）与单改状态（``update_window_status``）
+        共用同一段更新逻辑，避免两处漂移。
+        """
+        window.status = status
+        if retry_count is not None:
+            window.retry_count = retry_count
+        if error is not None:
+            window.error = error
+        window.updated_at = self.clock()
 
     async def get_window(self, window_id: int) -> Window | None:
         async with self._sessions() as session:
@@ -234,12 +246,7 @@ class Repository:
                 old.superseded_by = replacement.id
             window = await session.get(Window, window_id)
             if window is not None:
-                window.status = status
-                if retry_count is not None:
-                    window.retry_count = retry_count
-                if error is not None:
-                    window.error = error
-                window.updated_at = self.clock()
+                self._apply_window_status(window, status, retry_count=retry_count, error=error)
             await session.commit()
         return list(memories)
 
@@ -248,16 +255,19 @@ class Repository:
             return await session.get(Memory, memory_id)
 
     async def list_group_memories(
-        self, *, group_id: int, include_expired: bool = False
+        self, *, group_id: int, include_inactive: bool = False
     ) -> list[Memory]:
         """取某群的**全部**条目，新的在前。
 
         ``recent_memories`` 只给最近若干条，够窗口摘要用；去重比对照的是同群全部条目，
-        所以另开这一个读方法。默认排除已过期（``expired``）的条目。
+        所以另开这一个读方法（提取管道传 ``include_inactive=True``）。
+
+        默认只给 ``active`` 的条目：被 supersede 的旧条目（``expired``）与疑似重复
+        （``suspect_duplicate``）默认退出检索与推送（故事 22），显式开关可一并取回。
         """
         statement = select(Memory).where(Memory.group_id == group_id)
-        if not include_expired:
-            statement = statement.where(Memory.status != MemoryStatus.EXPIRED)
+        if not include_inactive:
+            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
         statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc())
         async with self._sessions() as session:
             result = await session.execute(statement)
@@ -288,11 +298,16 @@ class Repository:
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 50,
+        include_inactive: bool = False,
     ) -> list[Memory]:
         """FTS5 关键词检索，可按类别 / 群 / 时间范围过滤。
 
         trigram 分词对中文按子串匹配，但匹配词至少 3 个字；两字及以下的词（如「论文」）
         走 LIKE 兜底。多个空格分隔的词之间是「与」的关系。
+
+        默认只检索 ``active`` 条目：被 supersede 的旧条目（``expired``）与疑似重复
+        （``suspect_duplicate``）默认退出检索（故事 22）；``include_inactive=True``
+        才一并取回，供「一键恢复 / 回看历史」这类场景使用。
         """
         terms = [term for term in query.split() if term]
         if not terms:
@@ -302,6 +317,8 @@ class Repository:
         short_terms = [term for term in terms if len(term) < 3]
 
         statement = select(Memory)
+        if not include_inactive:
+            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
         if long_terms:
             match_expression = " AND ".join('"' + term.replace('"', '""') + '"' for term in long_terms)
             statement = statement.where(
@@ -373,6 +390,12 @@ class Repository:
         success: bool = True,
         error: str | None = None,
     ) -> LlmCall:
+        """记一次聊天 / 向量调用，``purpose`` 区分用途（如 ``extract`` / ``embed``）。
+
+        这条记账**独立于窗口事务、自行提交**（对比 ``add_window_result``）：窗口写库
+        整体回滚时账目仍保留。这是有意为之——每次真实发生、会被计费的调用都要留痕，
+        否则回滚会把已花的钱从账上抹掉，「这个功能每月花多少」就答不准了。
+        """
         call = LlmCall(
             purpose=purpose,
             provider=provider,

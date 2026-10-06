@@ -329,7 +329,7 @@ async def test_exhausted_parse_failures_land_in_the_dead_letter(repo: Repository
     assert window.status is WindowStatus.DEAD
     assert window.retry_count == 2
     assert window.error is not None and "未能产出可用结果" in window.error
-    assert await repo.list_group_memories(group_id=111, include_expired=True) == []
+    assert await repo.list_group_memories(group_id=111, include_inactive=True) == []
 
 
 async def test_timeout_retries_and_then_lands_in_the_dead_letter(repo: Repository) -> None:
@@ -419,7 +419,7 @@ async def test_add_window_result_rolls_back_the_whole_window_on_failure(repo: Re
 
     reloaded = await repo.get_window(window.id)
     assert reloaded is not None and reloaded.status is WindowStatus.PENDING
-    assert await repo.list_group_memories(group_id=111, include_expired=True) == []
+    assert await repo.list_group_memories(group_id=111, include_inactive=True) == []
 
 
 # —— 管道：两层去重 ——

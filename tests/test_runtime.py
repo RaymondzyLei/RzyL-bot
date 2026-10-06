@@ -237,6 +237,79 @@ async def test_embedding_backfill_is_a_noop_without_a_vector_service(
         await runtime.stop()
 
 
+class _MeteredEmbedding:
+    """报告输入 token 的假向量，用来验证补算记账真的落了库。"""
+
+    def __init__(self, *, tokens: int) -> None:
+        self.last_input_tokens: int | None = tokens
+        self._inner = DeterministicEmbedding(8)
+
+    async def embed(self, texts):  # noqa: ANN001 —— 测试替身，形状对齐协议即可
+        return await self._inner.embed(texts)
+
+
+async def test_embedding_backfill_records_usage_and_cost(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """补算调向量服务也要进记账：用途为 embed、带模型名与按 embedding_price 估的费用。"""
+    runtime = _runtime(
+        tmp_path,
+        clock,
+        embedding_model=_MeteredEmbedding(tokens=1000),
+        embedding_price=2.0,
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        await runtime.repository.add_memory(
+            group_id=GROUP,
+            category=Category.KNOWLEDGE,
+            statement="需要补算向量的结论",
+            confidence=0.9,
+            prompt_version="v1",
+        )
+
+        assert await runtime.backfill_embeddings() == 1
+
+        calls = await runtime.repository.list_llm_calls(purpose="embed")
+        assert len(calls) == 1
+        assert calls[0].model == runtime.settings.embedding_model
+        assert calls[0].tokens_in == 1000
+        assert calls[0].tokens_out == 0
+        assert calls[0].success is True
+        assert calls[0].cost == pytest.approx(1000 * 2.0 / 1_000_000)
+    finally:
+        await runtime.stop()
+
+
+async def test_embedding_backfill_records_a_failed_call_without_fabricating_usage(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """服务不可用时也留痕：成功位为假，用量按实际能拿到的 0 记，绝不编造。"""
+    runtime = _runtime(
+        tmp_path, clock, embedding_model=NullEmbedding(), embedding_price=2.0
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        await runtime.repository.add_memory(
+            group_id=GROUP,
+            category=Category.KNOWLEDGE,
+            statement="服务不可用",
+            confidence=0.9,
+            prompt_version="v1",
+        )
+
+        assert await runtime.backfill_embeddings() == 0
+
+        calls = await runtime.repository.list_llm_calls(purpose="embed")
+        assert len(calls) == 1
+        assert calls[0].success is False
+        assert calls[0].tokens_in == 0
+        assert calls[0].cost == 0.0
+        assert calls[0].error is not None
+    finally:
+        await runtime.stop()
+
+
 # —— 离线假模型 ——
 
 

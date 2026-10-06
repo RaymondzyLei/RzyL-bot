@@ -112,3 +112,10 @@ class Settings(BaseSettings):
     def estimate_chat_cost(self, tokens_in: int, tokens_out: int) -> float:
         """按配置单价估算一次聊天调用的费用（价格单位：每百万 token）。"""
         return (tokens_in * self.chat_input_price + tokens_out * self.chat_output_price) / 1_000_000
+
+    def estimate_embedding_cost(self, tokens_in: int) -> float:
+        """按配置单价估算一次向量调用的费用（``embedding_price`` 是每百万输入 token 的单价）。
+
+        向量服务通常只按输入 token 计费；调用方拿不到用量时传 0，费用自然为 0。
+        """
+        return tokens_in * self.embedding_price / 1_000_000

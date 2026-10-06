@@ -140,6 +140,31 @@ async def test_flush_expired_closes_a_quiet_window(repo: Repository) -> None:
     assert await assembler.flush_expired() == []
 
 
+async def test_windowing_follows_message_times_not_a_frozen_clock(repo: Repository) -> None:
+    """掉线回补回归：时钟停住不动，一批间隔很小的历史消息仍按各自时间切窗。
+
+    旧实现拿「当下时钟 − 缓冲首条时间」判超时：回补时时钟是当下、消息却是历史，
+    每条都远超窗口，于是每条各自成窗（回补彻底失效）。成窗改为看**消息自身时间**后，
+    这 9 条各隔 1 分钟的消息应切成 [5 条, 4 条] 两个窗口，而不是 9 个单条窗口。
+    """
+    from rzyl_core.pipeline import WindowAssembler
+
+    frozen_now = _Clock(BEGIN + timedelta(days=1))
+    assembler = WindowAssembler(
+        repository=repo, clock=frozen_now, settings=_settings(limit=100, minutes=5)
+    )
+
+    windows = []
+    for minute in range(9):
+        windows.extend(await assembler.add(_message(minute + 1, minutes=minute)))
+    remainder = await assembler.flush_group(111)
+    if remainder is not None:
+        windows.append(remainder)
+
+    assert [window.message_count for window in windows] == [5, 4]
+    assert assembler.buffered_count(111) == 0
+
+
 async def test_flush_group_closes_a_partial_window(repo: Repository) -> None:
     from rzyl_core.pipeline import WindowAssembler
 

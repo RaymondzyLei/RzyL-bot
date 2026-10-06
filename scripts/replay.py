@@ -126,7 +126,9 @@ def _print_previews(report: ReplayReport) -> None:
 
 
 async def _print_persisted(runtime: Runtime, group_id: int) -> None:
-    memories = await runtime.repository.list_group_memories(group_id=group_id)
+    memories = await runtime.repository.list_group_memories(
+        group_id=group_id, include_inactive=True
+    )
     print(RULE)
     print(f"落库条目（群 {group_id}，共 {len(memories)} 条）")
     print(RULE)

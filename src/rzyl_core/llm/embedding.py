@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import random
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol, TypeAlias, runtime_checkable
 
 #: 一条向量就是一组浮点数。维度由具体实现决定（假实现默认 1024）。
@@ -23,6 +24,47 @@ class EmbeddingModel(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[Embedding] | None:
         """为一批文本算向量；返回 ``None`` 表示当前不可用。"""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingBatch:
+    """一次批量向量调用归一化后的结果。
+
+    - ``vectors`` 为 ``None`` 表示整批不可用（服务返回 ``None``、数量与输入不符或抛异常），
+      调用方应把向量留空；
+    - 否则它与输入等长，某一条算不出来时对应位置为 ``None``；
+    - ``error`` 在整批不可用时说明原因，供记账与排障。
+    """
+
+    vectors: list[Embedding | None] | None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.vectors is not None
+
+
+async def embed_batch(model: EmbeddingModel, texts: Sequence[str]) -> EmbeddingBatch:
+    """批量取向量，把「服务不可用」统一降级为 ``vectors=None``，绝不抛出。
+
+    提取管道与 Runtime 的向量补算共用这段容错：空输入视为成功且返回空列表；服务返回
+    ``None``、数量与输入不符或调用抛异常都归一为整批不可用。这样「向量是尽力而为」
+    这条约定只实现一次。
+    """
+    if not texts:
+        return EmbeddingBatch(vectors=[])
+    try:
+        vectors = await model.embed(texts)
+    except Exception as exc:  # 向量服务抖动不应阻塞调用方
+        return EmbeddingBatch(vectors=None, error=f"向量服务调用失败：{exc}")
+    if vectors is None:
+        return EmbeddingBatch(vectors=None, error="向量服务不可用（返回 None）")
+    if len(vectors) != len(texts):
+        return EmbeddingBatch(
+            vectors=None,
+            error=f"向量数量与输入不符：返回 {len(vectors)} 条，输入 {len(texts)} 条",
+        )
+    return EmbeddingBatch(vectors=[list(vector) if vector else None for vector in vectors])
 
 
 class DeterministicEmbedding:
@@ -57,4 +99,11 @@ class NullEmbedding:
         return None
 
 
-__all__ = ["DeterministicEmbedding", "Embedding", "EmbeddingModel", "NullEmbedding"]
+__all__ = [
+    "DeterministicEmbedding",
+    "Embedding",
+    "EmbeddingBatch",
+    "EmbeddingModel",
+    "NullEmbedding",
+    "embed_batch",
+]

@@ -243,12 +243,31 @@ class OpenAICompatEmbeddingClient(_OpenAICompatClientBase):
             backoff_base=backoff_base,
             transport=transport,
         )
+        #: 最近一次 ``embed`` 服务上报的输入 token；响应未带 usage 时为 ``None``。
+        self._last_input_tokens: int | None = None
+
+    @property
+    def last_input_tokens(self) -> int | None:
+        """最近一次 ``embed`` 的上报输入 token，供装配层记账；取不到就是 ``None``。
+
+        向量接口本身不返回用量，这里把服务上报的值留在实例上；调用方（Runtime）
+        据此估算费用，取不到时按 0 记，不编造。
+        """
+        return self._last_input_tokens
 
     async def embed(self, texts: Sequence[str]) -> list[Embedding] | None:
         if not texts:
             return []
+        # 每次调用先清空，失败或响应无 usage 时不残留上一次的数字。
+        self._last_input_tokens = None
         payload: dict[str, Any] = {"model": self._model, "input": list(texts)}
         data = await self._request_json("embeddings", payload, operation="向量嵌入")
+
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            if isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool):
+                self._last_input_tokens = prompt_tokens
 
         items = data.get("data")
         if not isinstance(items, list):

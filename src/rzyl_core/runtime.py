@@ -30,10 +30,9 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
 - ``dry_run``：消息写进一个临时库（窗口的编号映射需要真实的 ``message.id``），每个窗口
   只调一次模型、打印完整提示词与原始输出，**配置的库一条不写**，临时库用完即删。
 
-回放还解决了一个务必做对的点（上游已在 ``pipeline/window.py`` 写明）：**时钟要跟着
-「当前正在回放的那条消息」走**。窗口的时间成窗判定是拿注入时钟与缓冲首条消息的时间比；
-回放若沿用真实当下，历史消息会瞬间全部超时成窗。所以回放内部自建一个 :class:`_ReplayClock`，
-每条消息进来前把它拨到该消息的发送时间。
+回放不需要为时钟做特殊处理：窗口的成窗时间判定已经改为基于**消息自身**的 ``sent_at``
+（见 ``pipeline/window.py``），所以实时链路、离线回放与里程碑 2 的掉线回补三条路径
+共用同一个注入时钟即可，历史消息不会被当下时钟「瞬间顶成窗」。
 """
 
 from __future__ import annotations
@@ -42,21 +41,24 @@ import asyncio
 import inspect
 import logging
 import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 from rzyl_core.db import Message, Repository
-from rzyl_core.llm import ChatModel, EmbeddingModel
+from rzyl_core.llm import ChatModel, EmbeddingModel, embed_batch
 from rzyl_core.pipeline.extract import ExtractionOutcome, ExtractionPipeline, PreviewOutcome
 from rzyl_core.pipeline.history import HistorySource, HistoryMessage, message_dedupe_hash
 from rzyl_core.pipeline.window import (
     DEFAULT_PREVIOUS_TAIL_SIZE,
     DEFAULT_REMEMBERED_LIMIT,
+    AssembledWindow,
     WindowAssembler,
 )
 from rzyl_core.settings import Settings
+from rzyl_core.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +71,33 @@ EMBEDDING_SWEEP_SECONDS = 300
 #: 一次向量补算最多处理多少条，避免一次拉太多进内存。
 EMBEDDING_BACKFILL_BATCH = 100
 
+#: 向量调用写进 ``llm_call.purpose`` 的用途标签。
+EMBED_PURPOSE = "embed"
 
-def _utcnow() -> datetime:
-    """默认时间源：当前 UTC 时刻（带时区）。"""
-    return datetime.now(timezone.utc)
+#: 回放主循环返回的每窗口结果类型（预览或提取结果）。
+T = TypeVar("T")
+
+
+def _embedding_input_tokens(model: EmbeddingModel) -> int:
+    """取向量实现最近一次上报的输入 token；没有可用用量信息时记 0，不编造。"""
+    tokens = getattr(model, "last_input_tokens", None)
+    if isinstance(tokens, int) and not isinstance(tokens, bool):
+        return tokens
+    return 0
+
+
+async def _preview_window(
+    pipeline: ExtractionPipeline, window: AssembledWindow
+) -> PreviewOutcome:
+    """回放 dry-run 策略：只渲染 + 调一次模型，不写任何配置库。"""
+    return await pipeline.preview_window(window)
+
+
+async def _process_window(
+    pipeline: ExtractionPipeline, window: AssembledWindow
+) -> ExtractionOutcome:
+    """回放正常策略：走完整的校验、去重与入库。"""
+    return await pipeline.process_window(window)
 
 
 async def _close_if_possible(resource: object) -> None:
@@ -86,19 +111,6 @@ async def _close_if_possible(resource: object) -> None:
     result = aclose()
     if inspect.isawaitable(result):
         await result
-
-
-class _ReplayClock:
-    """回放专用时钟：值由回放逐条拨到「当前回放消息」的发送时间。
-
-    窗口的成窗判定读它而不是读真实时间，历史消息才不会瞬间全部成窗（见模块 docstring）。
-    """
-
-    def __init__(self, now: datetime) -> None:
-        self.now = now
-
-    def __call__(self) -> datetime:
-        return self.now
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +164,7 @@ class Runtime:
         self._chat = chat_model
         self._embedding = embedding_model
         self._settings = settings
-        self._clock: Callable[[], datetime] = clock or _utcnow
+        self._clock: Callable[[], datetime] = clock or utcnow
         self._database_url = database_url or settings.database_url
         self._provider = provider
         self._previous_tail_size = previous_tail_size
@@ -306,26 +318,50 @@ class Runtime:
     async def backfill_embeddings(self, *, limit: int = EMBEDDING_BACKFILL_BATCH) -> int:
         """给还没算向量的活条目补算并写回，返回成功补上的条数。
 
-        向量服务不可用（返回 ``None``、数量不符或抛异常）时本轮返回 0、什么都不改。
+        向量服务不可用（返回 ``None``、数量不符或抛异常）时本轮不改任何条目、返回 0；
+        但这次**确已发生**的调用仍会记进 ``llm_call``（``purpose="embed"``），
+        成功与失败都留痕，便于成本与可用性可见。
         """
         repository = self._require_repository()
         pending = await repository.list_memories_missing_embedding(limit=limit)
         if not pending:
             return 0
-        try:
-            vectors = await self._embedding.embed([str(memory.statement) for memory in pending])
-        except Exception:
-            logger.exception("向量补算调用失败，本轮跳过")
-            return 0
-        if vectors is None or len(vectors) != len(pending):
+        batch = await embed_batch(
+            self._embedding, [str(memory.statement) for memory in pending]
+        )
+        await self._record_embedding_call(success=batch.ok, error=batch.error)
+        if batch.vectors is None:
+            logger.warning("向量补算不可用，本轮跳过：%s", batch.error)
             return 0
         filled = 0
-        for memory, vector in zip(pending, vectors):
-            if vector and await repository.update_memory_embedding(int(memory.id), list(vector)):
+        for memory, vector in zip(pending, batch.vectors):
+            if vector is not None and await repository.update_memory_embedding(
+                int(memory.id), vector
+            ):
                 filled += 1
         if filled:
             logger.info("向量补算写回 %d 条", filled)
         return filled
+
+    async def _record_embedding_call(self, *, success: bool, error: str | None) -> None:
+        """把一次向量服务调用记进 ``llm_call``。
+
+        ``llm_call`` 在窗口事务之外独立提交是有意为之：每次真实发生、会被计费的调用
+        都要留痕（窗口回滚也不该抹掉已发生的成本），从而回答「这个功能每月花多少」。
+        向量接口不返回用量，故 token 取实现上报的输入 token，取不到记 0，绝不编造；
+        费用按 ``settings.embedding_price`` 估算（拿不到 token 时自然为 0）。
+        """
+        repository = self._require_repository()
+        tokens_in = _embedding_input_tokens(self._embedding)
+        await repository.add_llm_call(
+            purpose=EMBED_PURPOSE,
+            model=self._settings.embedding_model,
+            tokens_in=tokens_in,
+            tokens_out=0,
+            cost=self._settings.estimate_embedding_cost(tokens_in),
+            success=success,
+            error=error,
+        )
 
     async def _embedding_loop(self) -> None:
         """按固定间隔跑向量补算；单轮失败不影响下一轮。"""
@@ -354,29 +390,26 @@ class Runtime:
         正常模式写进配置的库并返回每个窗口的提取结果；``dry_run`` 只产出提示词与模型
         原始输出，配置的库一条不写（消息落在临时库，用完即删，见模块 docstring）。
         ``dry_run`` 甚至**不要求 Runtime 已经 start**——它压根不碰配置的库。
+
+        两种模式共用 :meth:`_replay_windows` 这一个循环，只差对每个窗口做什么
+        （``preview_window`` 还是 ``process_window``）。
         """
         if not dry_run:
             self._require_repository()
         messages = await source.fetch(group_id=group_id, since=since, limit=limit)
-        replay_clock = _ReplayClock(self._clock())
 
         if dry_run:
             with tempfile.TemporaryDirectory(prefix="rzyl-dryrun-") as directory:
                 temporary = await Repository.create(
-                    f"sqlite+aiosqlite:///{Path(directory) / 'dryrun.db'}", clock=replay_clock
+                    f"sqlite+aiosqlite:///{Path(directory) / 'dryrun.db'}", clock=self._clock
                 )
                 try:
-                    assembler = self._build_assembler(temporary, replay_clock)
-                    pipeline = self._build_pipeline(temporary, replay_clock)
-                    previews: list[PreviewOutcome] = []
-                    for message in messages:
-                        replay_clock.now = message.sent_at
-                        stored = await self._store_message(temporary, message)
-                        for window in await assembler.add(stored):
-                            previews.append(await pipeline.preview_window(window))
-                    remainder = await assembler.flush_group(group_id)
-                    if remainder is not None:
-                        previews.append(await pipeline.preview_window(remainder))
+                    previews = await self._replay_windows(
+                        repository=temporary,
+                        messages=messages,
+                        group_id=group_id,
+                        handle=_preview_window,
+                    )
                 finally:
                     await temporary.close()
             return ReplayReport(
@@ -388,17 +421,12 @@ class Runtime:
             )
 
         repository = self._require_repository()
-        assembler = self._build_assembler(repository, replay_clock)
-        pipeline = self._build_pipeline(repository, replay_clock)
-        outcomes: list[ExtractionOutcome] = []
-        for message in messages:
-            replay_clock.now = message.sent_at
-            stored = await self._store_message(repository, message)
-            for window in await assembler.add(stored):
-                outcomes.append(await pipeline.process_window(window))
-        remainder = await assembler.flush_group(group_id)
-        if remainder is not None:
-            outcomes.append(await pipeline.process_window(remainder))
+        outcomes = await self._replay_windows(
+            repository=repository,
+            messages=messages,
+            group_id=group_id,
+            handle=_process_window,
+        )
         return ReplayReport(
             group_id=group_id,
             dry_run=False,
@@ -406,6 +434,32 @@ class Runtime:
             window_count=len(outcomes),
             outcomes=tuple(outcomes),
         )
+
+    async def _replay_windows(
+        self,
+        *,
+        repository: Repository,
+        messages: Sequence[HistoryMessage],
+        group_id: int,
+        handle: Callable[[ExtractionPipeline, AssembledWindow], Awaitable[T]],
+    ) -> list[T]:
+        """回放主循环：逐条落库、成窗即交给 ``handle``；收尾再 flush 一次该群缓冲。
+
+        成窗只依赖消息自身时间（见 ``pipeline/window.py``），所以时钟直接沿用 Runtime
+        注入的那个即可，不需要再为回放临时改时钟。dry-run 与正常模式的差别只体现在
+        传入的 ``handle`` 上——前者绝不写配置库，后者走完整入库。
+        """
+        assembler = self._build_assembler(repository, self._clock)
+        pipeline = self._build_pipeline(repository, self._clock)
+        results: list[T] = []
+        for message in messages:
+            stored = await self._store_message(repository, message)
+            for window in await assembler.add(stored):
+                results.append(await handle(pipeline, window))
+        remainder = await assembler.flush_group(group_id)
+        if remainder is not None:
+            results.append(await handle(pipeline, remainder))
+        return results
 
     async def _store_message(self, repository: Repository, message: HistoryMessage) -> Message:
         """把一条历史消息落库；去重 hash 用群号 + 发送者 + 时间 + 原文（供里程碑 2 回补去重）。"""
@@ -470,6 +524,7 @@ class Runtime:
 __all__ = [
     "EMBEDDING_BACKFILL_BATCH",
     "EMBEDDING_SWEEP_SECONDS",
+    "EMBED_PURPOSE",
     "RETENTION_SWEEP_SECONDS",
     "IngestResult",
     "ReplayReport",
