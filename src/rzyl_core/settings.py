@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.7
     """推送时只列不低于该置信度的条目；入库不设门槛。"""
 
+    # —— 提取与去重 ——
+    extract_max_attempts: int = 3
+    """一个窗口最多尝试提取几次（含首次）；用尽仍失败则整窗进死信。"""
+
+    dedupe_similarity_threshold: float = 0.92
+    """向量余弦去重阈值：同群同类别且相似度不低于它，新条目标为疑似重复。"""
+
     timezone: str = "Asia/Shanghai"
     """自然日与推送时刻所依据的时区。"""
 
