@@ -1,13 +1,25 @@
-"""核心流水线：采集缓冲、窗口组装、（后续的）提取、去重、入库。
+"""核心流水线：采集缓冲、窗口组装、提取、去重、入库。
 
-工单 #4 先交付**窗口组装**：把一个群的连续消息流攒成可直接交给模型的一段。
-对外只暴露 ``rzyl_core.pipeline.window`` 里的公开名字，见该模块 docstring 的契约说明。
+工单 #4 交付**窗口组装**（``rzyl_core.pipeline.window``）；工单 #7 交付**提取入库**
+（``rzyl_core.pipeline.extract``）。对外只暴露这两个模块里的公开名字。
 
-    from rzyl_core.pipeline import WindowAssembler, assemble_window
+    from rzyl_core.pipeline import WindowAssembler, ExtractionPipeline
 """
 
 from __future__ import annotations
 
+from rzyl_core.pipeline.extract import (
+    LLM_PURPOSE,
+    ExtractedMemory,
+    ExtractedPersonRef,
+    ExtractionOutcome,
+    ExtractionParseError,
+    ExtractionPipeline,
+    cosine_similarity,
+    dedupe_hash,
+    normalize_statement,
+    parse_extraction,
+)
 from rzyl_core.pipeline.window import (
     DEFAULT_PREVIOUS_TAIL_SIZE,
     DEFAULT_REMEMBERED_LIMIT,
@@ -25,13 +37,23 @@ from rzyl_core.pipeline.window import (
 __all__ = [
     "DEFAULT_PREVIOUS_TAIL_SIZE",
     "DEFAULT_REMEMBERED_LIMIT",
+    "LLM_PURPOSE",
     "PREVIOUS_TAIL_HEADER",
     "AssembledWindow",
+    "ExtractedMemory",
+    "ExtractedPersonRef",
+    "ExtractionOutcome",
+    "ExtractionParseError",
+    "ExtractionPipeline",
     "SequencedMessage",
     "UnknownSequenceError",
     "WindowAssembler",
     "WindowMessage",
     "assemble_window",
+    "cosine_similarity",
+    "dedupe_hash",
+    "normalize_statement",
+    "parse_extraction",
     "sender_name",
     "summarize_memories",
 ]

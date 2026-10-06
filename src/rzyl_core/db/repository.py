@@ -204,9 +204,64 @@ class Repository:
             await session.commit()
         return memory
 
+    async def add_window_result(
+        self,
+        *,
+        window_id: int,
+        memories: Sequence[Memory] = (),
+        supersedings: Sequence[tuple[int, Memory]] = (),
+        status: WindowStatus = WindowStatus.DONE,
+        retry_count: int | None = None,
+        error: str | None = None,
+    ) -> list[Memory]:
+        """一个事务内写入本窗口的全部条目、标记被推翻的旧条目，并推进窗口状态。
+
+        ``memories`` 是调用方（提取管道）构造好、尚未入库的 ``Memory`` 对象；
+        ``supersedings`` 每项是（被推翻的旧条目编号, 指向它的新条目对象）——新条目编号
+        要 flush 之后才存在，所以传对象而不是编号。新条目不做反向修改，只有旧条目被置为
+        ``expired`` 并记住 ``superseded_by``。
+
+        整段要么全成、要么全不成：任一步报错都会回滚，窗口行保持调用前的状态（可重试）。
+        """
+        async with self._sessions() as session:
+            session.add_all(list(memories))
+            await session.flush()
+            for old_id, replacement in supersedings:
+                old = await session.get(Memory, old_id)
+                if old is None:
+                    continue
+                old.status = MemoryStatus.EXPIRED
+                old.superseded_by = replacement.id
+            window = await session.get(Window, window_id)
+            if window is not None:
+                window.status = status
+                if retry_count is not None:
+                    window.retry_count = retry_count
+                if error is not None:
+                    window.error = error
+                window.updated_at = self.clock()
+            await session.commit()
+        return list(memories)
+
     async def get_memory(self, memory_id: int) -> Memory | None:
         async with self._sessions() as session:
             return await session.get(Memory, memory_id)
+
+    async def list_group_memories(
+        self, *, group_id: int, include_expired: bool = False
+    ) -> list[Memory]:
+        """取某群的**全部**条目，新的在前。
+
+        ``recent_memories`` 只给最近若干条，够窗口摘要用；去重比对照的是同群全部条目，
+        所以另开这一个读方法。默认排除已过期（``expired``）的条目。
+        """
+        statement = select(Memory).where(Memory.group_id == group_id)
+        if not include_expired:
+            statement = statement.where(Memory.status != MemoryStatus.EXPIRED)
+        statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc())
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
 
     async def get_source_messages(self, memory_id: int) -> list[Message]:
         """取某条目引用的来源消息，按发送时间排序。"""
@@ -334,6 +389,18 @@ class Repository:
             session.add(call)
             await session.commit()
         return call
+
+    async def list_llm_calls(
+        self, *, purpose: str | None = None, limit: int = 50
+    ) -> list[LlmCall]:
+        """取最近的调用记账，新的在前；可按用途过滤。"""
+        statement = select(LlmCall)
+        if purpose is not None:
+            statement = statement.where(LlmCall.purpose == purpose)
+        statement = statement.order_by(LlmCall.created_at.desc(), LlmCall.id.desc()).limit(limit)
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
 
     async def add_feedback(
         self,
