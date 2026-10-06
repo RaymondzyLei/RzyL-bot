@@ -18,3 +18,6 @@ wheels/
 # 目录本身要保留：容器 bind mount 需要它存在且属主为 NAPCAT_UID
 napcat/config/*
 !napcat/config/.gitkeep
+
+# 交接文档：仅本地使用，不入库
+handoff/
