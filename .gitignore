@@ -21,3 +21,9 @@ napcat/config/*
 
 # 交接文档：仅本地使用，不入库
 handoff/
+
+# 运行时数据：记忆库（SQLite）、落盘的群图片等
+# 容器通过 bind mount 写这里，所以目录要在宿主机上真实存在
+data/
+
+.pytest_cache/

@@ -11,6 +11,11 @@ dist/
 .env
 .env.*
 
+# 运行时数据：记忆库与落盘图片由 bind mount 提供，绝不能打进镜像
+data/
+
+.pytest_cache/
+
 # 容器自身的描述文件，构建时不需要
 Dockerfile
 .dockerignore

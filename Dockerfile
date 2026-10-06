@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1
+# 这里刻意不写 `# syntax=docker/dockerfile:1`：那行会让每次构建都去 docker hub 解析
+# 前端镜像，而本机到 registry-1.docker.io 经常不通，构建就会直接失败。
+# 本文件只用经典指令（多阶段、ENV、COPY --chown），内置前端完全够用。
 
 # ---------- 构建阶段：用 uv 装依赖 ----------
 FROM python:3.14-slim AS builder
