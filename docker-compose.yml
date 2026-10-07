@@ -16,6 +16,8 @@ services:
     image: rzyl-bot:latest
     container_name: rzyl-bot
     restart: unless-stopped
+    # RZYL_* 全部走 .env（先 cp .env.example .env）
+    env_file: [.env]
     environment:
       DRIVER: "~fastapi"
       HOST: "0.0.0.0"
@@ -26,6 +28,9 @@ services:
       # 容器内没有 TTY，关掉 console 适配器
       ENABLE_CONSOLE_ADAPTER: "false"
       TZ: Asia/Shanghai
+    volumes:
+      # 记忆库（SQLite）与落盘的群图片必须落在宿主机上：能备份、能手工查
+      - ./data:/app/data
     networks: [rzyl]
     # 故意不发布 8080：/onebot/v11/ws 目前没开鉴权，只让容器网络内可达。
     # 需要从宿主机看离线文档或调试时，临时加上：

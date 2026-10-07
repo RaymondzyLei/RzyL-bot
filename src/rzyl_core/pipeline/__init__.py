@@ -9,6 +9,14 @@
 
 from __future__ import annotations
 
+from rzyl_core.pipeline.collector import (
+    SEGMENT_PLACEHOLDERS,
+    RenderedSegments,
+    collect,
+    merge_allowed_groups,
+    render_segments,
+    should_collect,
+)
 from rzyl_core.pipeline.extract import (
     LLM_PURPOSE,
     ExtractedMemory,
@@ -29,8 +37,12 @@ from rzyl_core.pipeline.history import (
     HistorySource,
     OneBotHistorySource,
     SampleHistorySource,
+    extract_history_messages,
+    fetch_onebot_history,
     message_dedupe_hash,
+    parse_onebot_message,
     render_message_segments,
+    resolve_backfill_since,
 )
 from rzyl_core.pipeline.window import (
     DEFAULT_PREVIOUS_TAIL_SIZE,
@@ -64,17 +76,27 @@ __all__ = [
     "ExtractionOutcome",
     "ExtractionParseError",
     "ExtractionPipeline",
+    "RenderedSegments",
+    "SEGMENT_PLACEHOLDERS",
     "SequencedMessage",
     "UnknownSequenceError",
     "WindowAssembler",
     "WindowMessage",
     "assemble_window",
+    "collect",
     "cosine_similarity",
     "dedupe_hash",
+    "extract_history_messages",
+    "fetch_onebot_history",
+    "merge_allowed_groups",
     "message_dedupe_hash",
     "normalize_statement",
     "parse_extraction",
+    "parse_onebot_message",
     "render_message_segments",
+    "render_segments",
+    "resolve_backfill_since",
     "sender_name",
+    "should_collect",
     "summarize_memories",
 ]

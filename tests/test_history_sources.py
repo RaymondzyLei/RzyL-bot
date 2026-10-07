@@ -21,6 +21,10 @@ from rzyl_core.pipeline.history import (
     HistoryFetchError,
     OneBotHistorySource,
     SampleHistorySource,
+    extract_history_messages,
+    fetch_onebot_history,
+    parse_onebot_message,
+    resolve_backfill_since,
 )
 from rzyl_core.settings import Settings
 
@@ -315,3 +319,111 @@ def test_onebot_source_from_settings_reads_root_and_token() -> None:
 
     assert source.api_root == "http://127.0.0.1:3000"
     assert source.access_token == "tok"
+
+
+# —— 共享的翻页与解析（插件侧 bot.call_api 回补复用）——
+
+
+def test_parse_onebot_message_extracts_sender_time_and_segments() -> None:
+    record = _onebot_message(
+        7,
+        user_id=10002,
+        segments=[
+            {"type": "text", "data": {"text": "看"}},
+            {"type": "image", "data": {"file": "x.png"}},
+        ],
+    )
+
+    message = parse_onebot_message(GROUP, record)
+
+    assert message.group_id == GROUP
+    assert message.user_id == 10002
+    assert message.text == "看[图片]"
+    assert message.message_seq == 7
+    assert message.nickname == "小A"
+    assert message.sent_at.tzinfo is not None
+    # 原始段落一并带回，供回补渲染出与实时链路一致的文本。
+    assert message.segments[1]["type"] == "image"
+
+
+def test_parse_onebot_message_rejects_a_record_without_time() -> None:
+    with pytest.raises(HistoryFetchError):
+        parse_onebot_message(GROUP, {"sender": {"user_id": 1}})
+
+
+def test_extract_history_messages_accepts_both_wrappers() -> None:
+    assert extract_history_messages({"messages": [{"seq": 1}]}) == [{"seq": 1}]
+    assert extract_history_messages({"data": {"messages": [{"seq": 2}]}}) == [{"seq": 2}]
+    assert extract_history_messages({}) is None
+
+
+async def test_fetch_onebot_history_pages_with_an_injected_page_fetcher() -> None:
+    """翻页逻辑与 HTTP 解耦：注入一个 fetch_page 即可复用（插件侧就是 bot.call_api）。"""
+    all_messages = [
+        _onebot_message(seq, text=f"第{seq}条", at=f"2026-10-07T09:0{seq}:00+08:00")
+        for seq in range(1, 10)
+    ]
+    seen: list[int] = []
+
+    async def fetch_page(message_seq: int) -> list[dict[str, Any]]:
+        seen.append(message_seq)
+        if message_seq <= 0:
+            return all_messages[-3:]
+        return [m for m in all_messages if m["message_seq"] <= message_seq][-3:]
+
+    messages = await fetch_onebot_history(group_id=GROUP, fetch_page=fetch_page)
+
+    assert [message.platform_message_id for message in messages] == list(range(1, 10))
+    assert seen == [0, 6, 3]
+
+
+async def test_fetch_onebot_history_stops_at_since_and_keeps_newest_limit() -> None:
+    all_messages = [
+        _onebot_message(seq, text=f"第{seq}条", at=f"2026-10-07T09:0{seq}:00+08:00")
+        for seq in range(1, 10)
+    ]
+
+    async def fetch_page(message_seq: int) -> list[dict[str, Any]]:
+        if message_seq <= 0:
+            return all_messages[-3:]
+        return [m for m in all_messages if m["message_seq"] <= message_seq][-3:]
+
+    since = datetime(2026, 10, 7, 9, 5, tzinfo=CST)
+    messages = await fetch_onebot_history(group_id=GROUP, fetch_page=fetch_page, since=since)
+
+    assert [message.platform_message_id for message in messages] == [6, 7, 8, 9]
+
+    limited = await fetch_onebot_history(group_id=GROUP, fetch_page=fetch_page, limit=4)
+    assert [message.platform_message_id for message in limited] == [6, 7, 8, 9]
+
+
+# —— 回补护栏：起点取锚点与 24 小时下限里的较晚者 ——
+
+
+def test_resolve_backfill_since_uses_the_anchor_when_inside_the_guard() -> None:
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=CST)
+    anchor = now - timedelta(hours=2)
+
+    since, clamped = resolve_backfill_since(anchor=anchor, now=now, max_hours=24)
+
+    assert since == anchor
+    assert clamped is False
+
+
+def test_resolve_backfill_since_clamps_an_old_anchor_and_reports_it() -> None:
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=CST)
+    anchor = now - timedelta(hours=30)
+
+    since, clamped = resolve_backfill_since(anchor=anchor, now=now, max_hours=24)
+
+    assert since == now - timedelta(hours=24)
+    assert clamped is True
+
+
+def test_resolve_backfill_since_without_an_anchor_uses_the_floor_silently() -> None:
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=CST)
+
+    since, clamped = resolve_backfill_since(anchor=None, now=now, max_hours=24)
+
+    assert since == now - timedelta(hours=24)
+    assert clamped is False

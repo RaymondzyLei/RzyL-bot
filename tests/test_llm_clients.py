@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -174,6 +175,39 @@ async def test_chat_client_bounds_concurrency() -> None:
         await asyncio.gather(*(client.complete("s", f"u{i}") for i in range(6)))
 
     assert peak <= 2
+
+
+async def test_chat_client_merges_extra_body_into_the_request() -> None:
+    """额外请求体原样合并：模型怪癖（如 enable_thinking）走配置，不改代码。"""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return chat_ok()
+
+    client = chat_client(handler, extra_body={"enable_thinking": False, "top_p": 0.8})
+    async with client:
+        await client.complete("系统", "用户")
+
+    assert seen["enable_thinking"] is False
+    assert seen["top_p"] == 0.8
+    # 基本字段仍由客户端生成，不被额外字段挤掉。
+    assert seen["model"] == "test-chat"
+    assert seen["messages"][0]["role"] == "system"
+
+
+async def test_chat_client_without_extra_body_sends_only_the_basics() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return chat_ok()
+
+    client = chat_client(handler)
+    async with client:
+        await client.complete("系统", "用户")
+
+    assert set(seen) == {"model", "messages"}
 
 
 def test_chat_client_rejects_missing_configuration() -> None:
