@@ -390,8 +390,8 @@ async def fetch_onebot_history(
 
     ``fetch_page(message_seq)`` 返回一页原始消息（``0`` 表示最新一页）。翻页规则与
     :class:`OneBotHistorySource` 完全一致：首请求取最新一页，之后用本页最老的
-    ``message_seq - 1`` 继续向更早要，落到 0 或本页没消息就停；落地前按时间排一次并
-    去重。把 HTTP 与翻页解耦，是为了让插件侧的 ``bot.call_api`` 回补复用同一段逻辑
+    ``message_seq`` 当锚点继续向更早要，本页没有新东西就停；落地前按时间排一次并去重。
+    把 HTTP 与翻页解耦，是为了让插件侧的 ``bot.call_api`` 回补复用同一段逻辑
     （容器内没有 OneBot HTTP 端点，``OneBotHistorySource`` 用不上）。
     """
     collected: list[HistoryMessage] = []
@@ -419,8 +419,15 @@ async def fetch_onebot_history(
         sequences = [
             message.message_seq for message in parsed if message.message_seq is not None
         ]
-        next_cursor = (min(sequences) - 1) if sequences else 0
-        if next_cursor <= 0:
+        if not sequences:
+            break
+        # 下一页从本页最老那条**自己**开始要，不要减一：NapCat 的
+        # ``get_group_msg_history`` 把 message_seq 当"消息锚点"用（先按短 ID 反查，
+        # 查不到就当原始 MsgId 用），没有"锚点减一"这种语义——减一得到的编号通常谁也
+        # 不认识，NapCat 直接抛"消息 X 不存在"，实测第二页就翻不动。
+        # 与上一页重叠的那一条由上面的 seen 集合（以及入库时的内容 hash）挡掉。
+        next_cursor = min(sequences)
+        if next_cursor == cursor:
             break
         cursor = next_cursor
 

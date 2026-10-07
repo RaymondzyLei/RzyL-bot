@@ -204,8 +204,9 @@ async def test_onebot_source_pages_backwards_until_the_start_of_history() -> Non
 
     assert [message.platform_message_id for message in messages] == list(range(1, 10))
     assert [message.text for message in messages][:2] == ["第1条", "第2条"]
-    # 请求以 0（最新）起，然后按「本页最老的 seq - 1」向更早翻；落到 0 就停。
-    assert [request["message_seq"] for request in seen] == [0, 6, 3]
+    # 请求以 0（最新）起，之后拿本页最老的 seq 当锚点向更早翻，本页没有新东西就停。
+    # 锚点不复位减一（见 fetch_onebot_history 里的注释：减一会被 NapCat 判成"消息不存在"）。
+    assert [request["message_seq"] for request in seen] == [0, 7, 5, 3, 1]
     assert all(request["group_id"] == GROUP for request in seen)
 
 
@@ -374,7 +375,9 @@ async def test_fetch_onebot_history_pages_with_an_injected_page_fetcher() -> Non
     messages = await fetch_onebot_history(group_id=GROUP, fetch_page=fetch_page)
 
     assert [message.platform_message_id for message in messages] == list(range(1, 10))
-    assert seen == [0, 6, 3]
+    # 游标是本页最老那条**自己**（不复位减一）：每页与上一页重叠一条，由 seen 挡掉。
+    # 减一版本的游标是 [0, 6, 3]——那正是实测里 NapCat 抛"消息 X 不存在"的病根。
+    assert seen == [0, 7, 5, 3, 1]
 
 
 async def test_fetch_onebot_history_stops_at_since_and_keeps_newest_limit() -> None:
