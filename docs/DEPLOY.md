@@ -17,8 +17,9 @@ QQ 服务器
                                                       ws://nonebot:8080/onebot/v11/ws
 ```
 
-- **服务名必须是 `nonebot`、端口必须是 `8080`**：NapCat 镜像内置的 `onebot11.json` 模板里
-  写死了 `ws://nonebot:8080/onebot/v11/ws`，改了就接不上。
+- **服务名必须是 `nonebot`、端口必须是 `8080`**：NapCat 镜像内置的 `nonebot` 模板里写死了
+  `ws://nonebot:8080/onebot/v11/ws`，容器启动时由它生成 `napcat/config/onebot11.json`，
+  改了就接不上。
 - 落盘的三处，各自的意义不同：
 
 | 位置 | 内容 | 丢了会怎样 |
@@ -55,7 +56,7 @@ uv run pyright       # 类型检查
 cp .env.example .env
 ```
 
-`.env.example` 里有全部键的注释（含默认值），下面是**必须改**的几项：
+`.env.example` 里有各项配置的注释与默认值，下面是**必须改**的几项：
 
 | 键 | 说明 |
 |---|---|
@@ -96,7 +97,7 @@ RZYL_GROUP_WHITELIST=123456789,987654321
 
 ```bash
 docker compose up -d --build
-docker compose logs napcat | head -40     # 里面有 WebUI 地址与 token
+docker compose logs napcat | grep -i webui   # WebUI 地址与 token（它在日志四十多行处，别用 head -40 截掉）
 ```
 
 浏览器打开 `http://127.0.0.1:6099/webui`（只绑本机），用 `WEBUI_TOKEN` 登录，**扫码登录
@@ -277,15 +278,22 @@ uv run pytest -q
 uv run pyright
 ```
 
-离线回放一段历史（不需要 QQ、不需要网络、不需要任何 key）：
+离线回放一段历史——它和线上跑的是同一套 `Runtime` 与同一份配置，所以调提示词、复现某个
+窗口的提取结果都从这条路径走。**但有两个开关必须显式给，否则会踩到线上**：
 
 ```bash
-# 用固定样本，走完整管道并落库
-uv run python scripts/replay.py --sample tests/fixtures/sample_history.json --group 100200300
+# 用固定样本 + 离线假模型，写进一个临时库（不碰线上库、不联网、不花钱）
+uv run python scripts/replay.py --sample tests/fixtures/sample_history.json --group 100200300 \
+  --fake --database-url "sqlite+aiosqlite:////tmp/rzyl-replay.db"
 
 # 只看完整提示词与模型原始输出，一个字都不写库
-uv run python scripts/replay.py --sample tests/fixtures/sample_history.json --group 100200300 --dry-run
+uv run python scripts/replay.py --sample tests/fixtures/sample_history.json --group 100200300 \
+  --dry-run --fake
 ```
 
-调提示词、换模型、复现某个窗口的提取结果都从这条路径走——它和线上跑的是同一套
-`Runtime` 与同一份配置。
+- **`--fake`**：不加就用配置里的真模型（联网、花钱）。只要 `.env` 里配了 key 就是真的，
+  配置齐全的机器上「离线回放」这句话是假的。
+- **`--database-url`**：不加就写进 `RZYL_DATABASE_URL`，也就是**线上那个库**——拿样本文件
+  跑一次就会往记忆库里灌一批虚构消息和条目。`--dry-run` 不受影响（它压根不写库）。
+
+脚本开头会打印三行「群 / 模式 / 库 / 模型」，跑之前照它核对一眼，这是最省事的自检。
