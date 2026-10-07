@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from rzyl_core.db import Category, Repository, WindowStatus
+from rzyl_core.db import Category, Repository, WindowStatus, decode_vector
 from rzyl_core.llm import (
     ChatModel,
     ChatResult,
@@ -222,6 +222,42 @@ async def test_embedding_backfill_fills_memories_without_a_vector(
         assert reloaded is not None and reloaded.embedding is not None
     finally:
         await runtime.stop()
+
+
+async def test_reembed_recomputes_memories_that_already_have_a_vector(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """换向量模型后：默认补算不动已有向量，``reembed=True`` 才连已有向量一起重算。"""
+    old = _runtime(tmp_path, clock, embedding_model=DeterministicEmbedding(4))
+    await old.start(run_background_tasks=False)
+    try:
+        memory = await old.repository.add_memory(
+            group_id=GROUP,
+            category=Category.KNOWLEDGE,
+            statement="结论：先跑基线再调参",
+            confidence=0.9,
+            prompt_version="v1",
+            embedding=[1.0, 0.0, 0.0, 0.0],  # 4 维旧向量，模拟换模型前的历史行
+        )
+    finally:
+        await old.stop()
+
+    new = _runtime(tmp_path, clock, embedding_model=DeterministicEmbedding(8))
+    await new.start(run_background_tasks=False)
+    try:
+        # 默认只补空向量：已有向量的条目不动，维度仍是 4。
+        assert await new.backfill_embeddings() == 0
+        untouched = await new.repository.get_memory(memory.id)
+        assert untouched is not None and untouched.embedding is not None
+        assert len(decode_vector(untouched.embedding)) == 4
+
+        # reembed=True：连已有向量一起按新模型重算，维度变成 8。
+        assert await new.backfill_embeddings(reembed=True) == 1
+        reloaded = await new.repository.get_memory(memory.id)
+        assert reloaded is not None and reloaded.embedding is not None
+        assert len(decode_vector(reloaded.embedding)) == 8
+    finally:
+        await new.stop()
 
 
 async def test_embedding_backfill_is_a_noop_without_a_vector_service(

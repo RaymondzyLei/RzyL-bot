@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -62,6 +63,8 @@ from rzyl_core.settings import Settings
 
 #: 聊天调用写进 ``llm_call.purpose`` 的用途标签。
 LLM_PURPOSE = "extract"
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionParseError(ValueError):
@@ -146,7 +149,13 @@ def dedupe_hash(statement: str) -> str:
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
-    """两个等长向量的余弦相似度；长度不符或任一为零向量时返回 0。"""
+    """两个等长向量的余弦相似度；长度不符或任一为零向量时返回 0。
+
+    这是**纯函数**：长度不符时只返回 0，不抛异常、不记日志。发现并上报这种不一致
+    （例如库里留着旧维度的历史行）是**调用方**的责任——见
+    :meth:`ExtractionPipeline._is_near_duplicate`，它会在比较前显式检查长度并记
+    ``WARNING``，免得维度不一致被误当成「不相似」而静默流失召回。
+    """
     if not left or not right or len(left) != len(right):
         return 0.0
     dot = sum(a * b for a, b in zip(left, right))
@@ -532,14 +541,31 @@ class ExtractionPipeline:
         batch_vectors: Sequence[tuple[Category, list[float]]],
         threshold: float,
     ) -> bool:
-        """同群、同类别、且与已有向量或本批已保留向量余弦不低于阈值。"""
+        """同群、同类别、且与已有向量或本批已保留向量余弦不低于阈值。
+
+        比较已有条目的向量前先看长度：库里可能留着换模型前、另一种维度的历史向量，
+        长度不符时 :func:`cosine_similarity` 只会返回 0。这里显式检查并记一条
+        ``WARNING``（带上条目编号与两个长度），以便发现「换模型后没重算向量」——
+        否则近重复认不出来却毫无提示，正是本项目最不能接受的静默召回流失。
+        """
         for candidate in candidates:
             if candidate.status is MemoryStatus.EXPIRED:
                 continue
             if candidate.category is not item.category:
                 continue
             other = decode_vector(candidate.embedding)
-            if other and cosine_similarity(vector, other) >= threshold:
+            if not other:
+                continue
+            if len(other) != len(vector):
+                logger.warning(
+                    "向量维度不一致：条目 #%s 是 %d 维，本批新向量是 %d 维——"
+                    "疑似换过向量模型但未重算向量，本次跳过该条目的近重复比较",
+                    candidate.id,
+                    len(other),
+                    len(vector),
+                )
+                continue
+            if cosine_similarity(vector, other) >= threshold:
                 return True
         for category, other in batch_vectors:
             if category is item.category and cosine_similarity(vector, other) >= threshold:

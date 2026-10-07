@@ -19,6 +19,8 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
   删掉 ``sent_at`` 早于截止时刻的原文；只删原文，记忆条目永久。
 - **向量补算**（``backfill_embeddings``）：**已实现**。取向量为空的活条目，批量算向量
   并写回；向量服务不可用（返回 ``None`` 或抛异常）时本轮什么都不做，条目照常保留。
+  另提供 ``reembed=True``：连已有向量的条目也一起按当前模型重算，供换向量模型后把旧
+  向量全部刷新（后台补算循环只用默认的 ``reembed=False``，不会自动重算全部向量）。
 - **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠
   ``_window_flush_loop`` 周期把未满的缓冲按时成窗并入库；间隔取
   ``settings.window_flush_seconds``。
@@ -376,32 +378,60 @@ class Runtime:
 
     # —— 后台任务：向量补算 ——
 
-    async def backfill_embeddings(self, *, limit: int = EMBEDDING_BACKFILL_BATCH) -> int:
-        """给还没算向量的活条目补算并写回，返回成功补上的条数。
+    async def backfill_embeddings(
+        self, *, limit: int = EMBEDDING_BACKFILL_BATCH, reembed: bool = False
+    ) -> int:
+        """给还没算向量的活条目补算并写回，返回成功写回的条数。
+
+        ``reembed=False``（默认）：只补**空向量**的条目；
+        ``reembed=True``：连**已有向量**的条目也一起按当前模型重算——换向量模型（维度
+        或语义空间变了）后靠它把旧向量全部刷成新模型的结果。两种模式都只认
+        ``active`` / ``suspect_duplicate``，已过期的条目不动。
 
         向量服务不可用（返回 ``None``、数量不符或抛异常）时本轮不改任何条目、返回 0；
         但这次**确已发生**的调用仍会记进 ``llm_call``（``purpose="embed"``），
         成功与失败都留痕，便于成本与可用性可见。
+
+        可观察性：每轮都记日志说明模式、处理条数、写回条数与未写回的原因（整批不可用
+        是 ``WARNING``，部分条目拿不到向量或写回失败也是 ``WARNING``）。
         """
         repository = self._require_repository()
-        pending = await repository.list_memories_missing_embedding(limit=limit)
+        if reembed:
+            pending = await repository.list_memories_for_reembedding(limit=limit)
+        else:
+            pending = await repository.list_memories_missing_embedding(limit=limit)
         if not pending:
             return 0
+        mode = "重算" if reembed else "补算"
         batch = await embed_batch(
             self._embedding, [str(memory.statement) for memory in pending]
         )
         await self._record_embedding_call(success=batch.ok, error=batch.error)
         if batch.vectors is None:
-            logger.warning("向量补算不可用，本轮跳过：%s", batch.error)
+            logger.warning(
+                "向量%s不可用，本轮跳过 %d 条：%s", mode, len(pending), batch.error
+            )
             return 0
         filled = 0
+        missing = 0
         for memory, vector in zip(pending, batch.vectors):
-            if vector is not None and await repository.update_memory_embedding(
-                int(memory.id), vector
-            ):
+            if vector is None:
+                missing += 1
+                continue
+            if await repository.update_memory_embedding(int(memory.id), vector):
                 filled += 1
+        failed = len(pending) - filled
         if filled:
-            logger.info("向量补算写回 %d 条", filled)
+            logger.info("向量%s写回 %d/%d 条", mode, filled, len(pending))
+        if failed:
+            logger.warning(
+                "向量%s有 %d/%d 条未写回（其中 %d 条服务未返回向量）；原因：%s",
+                mode,
+                failed,
+                len(pending),
+                missing,
+                batch.error or "服务对部分输入未返回向量或条目已不存在",
+            )
         return filled
 
     async def _record_embedding_call(self, *, success: bool, error: str | None) -> None:

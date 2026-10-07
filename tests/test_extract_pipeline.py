@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -540,6 +541,38 @@ async def test_near_duplicate_requires_the_same_category(repo: Repository) -> No
     assert outcome.suspect_count == 0
     memory = await repo.get_memory(outcome.memory_ids[0])
     assert memory is not None and memory.status is MemoryStatus.ACTIVE
+
+
+async def test_vector_dimension_mismatch_is_reported_as_a_warning(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """库里留着旧维度的历史行时，近重复判定要出声——不静默算 0。"""
+    stored = await repo.add_memory(
+        group_id=111,
+        category=Category.KNOWLEDGE,
+        statement="结论：先跑基线再调参",
+        confidence=0.9,
+        prompt_version="v1",
+        embedding=[1.0, 0.0, 0.0, 0.0],  # 4 维旧向量，模拟换模型前的历史行
+    )
+    embedding = DeterministicEmbedding(8)  # 新模型产出 8 维
+    pipeline = _pipeline(
+        repo,
+        script=[_reply([_item(category="knowledge", statement="先去跑个基线再谈调参")])],
+        embedding_model=embedding,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.pipeline.extract"):
+        outcome = await pipeline.process_window(_window())
+
+    assert outcome.status is WindowStatus.DONE
+    # 不一致的条目不该被判为重复（安全方向），但必须留下告警。
+    assert outcome.suspect_count == 0
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert str(stored.id) in message
+    assert "4" in message and "8" in message
 
 
 async def test_dedupe_threshold_is_configurable(repo: Repository) -> None:

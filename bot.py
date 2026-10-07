@@ -70,6 +70,9 @@ def _build_embedding_model(settings: Settings) -> EmbeddingModel:
         base_url=settings.embedding_base_url,
         api_key=settings.embedding_api_key,
         model=settings.embedding_model,
+        # 守住写入侧维度：服务返回的维度与配置不符就报错，避免库里混进两种维度、
+        # 让向量去重静默失效（换模型后应把 RZYL_EMBEDDING_DIM 改成新维度并重算向量）。
+        expected_dimension=settings.embedding_dim,
     )
 
 
