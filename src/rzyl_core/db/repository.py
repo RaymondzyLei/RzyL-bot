@@ -603,3 +603,20 @@ class Repository:
             memory.embedding = encode_vector(list(embedding))
             await session.commit()
             return True
+
+    async def list_memories_for_reembedding(self, *, limit: int = 100) -> list[Memory]:
+        """取需要**按新模型重算向量**的条目（**含已有向量**），按编号升序。
+
+        与 :meth:`list_memories_missing_embedding` 的唯一区别是不筛掉已有向量的条目：
+        换向量模型（维度或语义空间变了）后要把全部条目重算一遍，靠的就是这个查询。
+        只认 ``active`` / ``suspect_duplicate``，已过期的条目不再重算。
+        """
+        statement = (
+            select(Memory)
+            .where(Memory.status != MemoryStatus.EXPIRED)
+            .order_by(Memory.id)
+            .limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())

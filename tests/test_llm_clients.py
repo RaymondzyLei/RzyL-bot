@@ -302,6 +302,73 @@ async def test_embedding_client_rejects_missing_configuration() -> None:
             OpenAICompatEmbeddingClient(**(common | {field: value}))  # type: ignore[arg-type]
 
 
+async def test_embedding_client_rejects_vectors_that_do_not_match_expected_dimension() -> None:
+    """给了 expected_dimension 就校验每个返回向量的长度，不符抛 LLMResponseError。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]})
+
+    client = embedding_client(handler, expected_dimension=1024)
+    async with client:
+        with pytest.raises(LLMResponseError) as excinfo:
+            await client.embed(["一段文本"])
+
+    message = str(excinfo.value)
+    # 报错要说清「期望 N 维、实际 M 维」，并点出最可能的原因。
+    assert "1024" in message
+    assert "3" in message
+    assert "MRL" in message or "换" in message
+
+
+async def test_embedding_client_accepts_vectors_of_the_expected_dimension() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
+
+    client = embedding_client(handler, expected_dimension=2)
+    async with client:
+        assert await client.embed(["x"]) == [[0.1, 0.2]]
+
+
+async def test_embedding_client_never_sends_a_dimensions_parameter() -> None:
+    """刻意不往请求里加 dimensions：不同服务商支持不一致，加了可能直接 400。"""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    client = embedding_client(handler, expected_dimension=1024)
+    async with client:
+        with pytest.raises(LLMResponseError):
+            await client.embed(["x"])
+
+    assert "dimensions" not in seen
+    assert set(seen) == {"model", "input"}
+
+
+async def test_embedding_client_without_expected_dimension_does_not_check_dimension() -> None:
+    """expected_dimension 缺省为 None：行为与既有实现完全一致，不校验维度。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    client = embedding_client(handler)
+    async with client:
+        assert await client.embed(["x"]) == [[1.0]]
+
+
+def test_embedding_client_rejects_non_positive_expected_dimension() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(ValueError):
+        OpenAICompatEmbeddingClient(
+            base_url="https://api.example.invalid/v1",
+            api_key="sk-test",
+            model="test-embed",
+            expected_dimension=0,
+            transport=transport,
+        )
+
+
 def test_real_clients_satisfy_the_protocols() -> None:
     transport = httpx.MockTransport(lambda request: chat_ok())
     async_client = OpenAICompatChatClient(

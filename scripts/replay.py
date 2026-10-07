@@ -100,6 +100,8 @@ def _build_embedding_model(settings: Settings, *, timeout: float) -> EmbeddingMo
         api_key=settings.embedding_api_key,
         model=settings.embedding_model,
         timeout=timeout,
+        # 与 bot.py 一致：写入侧守住维度，不和配置一致就在调用时抛错。
+        expected_dimension=settings.embedding_dim,
     )
 
 

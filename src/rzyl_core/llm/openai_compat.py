@@ -234,7 +234,18 @@ class OpenAICompatChatClient(_OpenAICompatClientBase):
 
 
 class OpenAICompatEmbeddingClient(_OpenAICompatClientBase):
-    """OpenAI 兼容的向量客户端，POST ``{base_url}/embeddings``。"""
+    """OpenAI 兼容的向量客户端，POST ``{base_url}/embeddings``。
+
+    ``expected_dimension`` 可选：给了就校验服务返回的每条向量都是这个长度，不符抛
+    :class:`~rzyl_core.llm.errors.LLMResponseError`。这是「换模型后向量去重静默失效」
+    的写入侧防线——服务返回什么维度就存什么维度的话，库里会混进两种维度，而余弦比较
+    对长度不符只能返回 0，结果是近重复再也认不出来却毫无提示。默认 ``None``：
+    不校验维度，与既有行为完全一致。
+
+    **刻意不往请求里加 ``dimensions`` 参数**：不同服务商对它的支持不一致（有的忽略、
+    有的直接返回 400），加了可能把原本能用的请求打挂。把维度约束留在本地做校验，比
+    指望服务端按参数裁剪更稳。
+    """
 
     def __init__(
         self,
@@ -246,6 +257,7 @@ class OpenAICompatEmbeddingClient(_OpenAICompatClientBase):
         max_retries: int = 3,
         max_concurrency: int = 4,
         backoff_base: float = 0.5,
+        expected_dimension: int | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         super().__init__(
@@ -258,8 +270,17 @@ class OpenAICompatEmbeddingClient(_OpenAICompatClientBase):
             backoff_base=backoff_base,
             transport=transport,
         )
+        if expected_dimension is not None and expected_dimension <= 0:
+            raise ValueError(f"expected_dimension 必须为正数，收到 {expected_dimension}")
+        #: 期望的向量维度；``None`` 表示不校验。
+        self._expected_dimension = expected_dimension
         #: 最近一次 ``embed`` 服务上报的输入 token；响应未带 usage 时为 ``None``。
         self._last_input_tokens: int | None = None
+
+    @property
+    def expected_dimension(self) -> int | None:
+        """配置的期望维度；未配置时为 ``None``（不校验）。"""
+        return self._expected_dimension
 
     @property
     def last_input_tokens(self) -> int | None:
@@ -303,6 +324,15 @@ class OpenAICompatEmbeddingClient(_OpenAICompatClientBase):
             raise LLMResponseError(
                 f"向量嵌入数量与输入不符：输入 {len(texts)} 条，返回 {len(vectors)} 条"
             )
+        if self._expected_dimension is not None:
+            for vector in vectors:
+                if len(vector) != self._expected_dimension:
+                    raise LLMResponseError(
+                        f"向量维度不符：期望 {self._expected_dimension} 维，"
+                        f"服务实际返回 {len(vector)} 维。最可能的原因是换过向量模型"
+                        f"（不同模型维度不同），或按 MRL 截断了维度；请确认向量模型与"
+                        f" RZYL_EMBEDDING_DIM 一致，若刚换模型就按新维度跑一次向量重算。"
+                    )
         return vectors
 
 
