@@ -112,6 +112,23 @@ class Settings(BaseSettings):
     backfill_page_size: int = 20
     """回补时 ``get_group_msg_history`` 每页的条数。"""
 
+    # —— 启动对账（里程碑 2）——
+    reconcile_on_startup: bool = True
+    """是否在 ``Runtime.start()`` 时自动跑一次「未覆盖消息对账」。
+
+    窗口缓冲只在内存里，进程重启时未满的窗口会丢；那些消息还在 ``message`` 表里，却因为
+    掉线回补的锚点是「最后一条已存消息的时间」而永远不会被提取。打开这一项，启动时用
+    一次性后台任务把它们重新成窗、提取、入库。任务不阻塞启动（可能调几十次模型），
+    ``run_background_tasks=False`` 时（测试与脚本）不自动跑，方法仍可手动调用。
+    """
+
+    reconcile_max_messages: int = 200
+    """对账时**每个群**最多处理多少条未覆盖的消息。
+
+    到上限即停止该群、记一条 ``WARNING``，剩下的留到下次启动或手动调用；这是防止对账
+    一次拉太多进内存、调太多次模型的护栏。
+    """
+
     # —— 存储 ——
     database_url: str = "sqlite+aiosqlite:///data/rzyl.db"
     """SQLite 连接串。默认落在宿主机的 ``data/`` 目录，便于备份与手工查询。"""
