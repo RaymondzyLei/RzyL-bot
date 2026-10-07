@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from pathlib import Path
 
 import nonebot
@@ -13,6 +14,26 @@ from rzyl_core.llm import (
 )
 from rzyl_core.runtime import Runtime, set_runtime
 from rzyl_core.settings import Settings
+
+
+def _configure_logging() -> None:
+    """让本项目自己的日志可见。
+
+    NoneBot 走 loguru，本项目（``bot`` 与 ``rzyl_core.*``）走标准库 logging。标准库
+    记录默认没有 handler，INFO 会被静默丢掉——于是"记忆管道到底有没有在工作"在
+    ``docker logs`` 里完全看不出来。这里给根 logger 挂一个 stdout handler，级别跟随
+    NoneBot 的 ``LOG_LEVEL``（默认 INFO）。
+    """
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+_configure_logging()
 
 nonebot.init()
 
