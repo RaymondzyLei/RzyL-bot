@@ -565,6 +565,45 @@ class Repository:
             value = (await session.execute(statement)).scalar()
         return value if isinstance(value, datetime) else None
 
+    async def list_uncovered_messages(
+        self, *, group_id: int, limit: int = 100
+    ) -> list[Message]:
+        """取某群里**没有被任何窗口的时间区间覆盖**的消息，按 ``sent_at`` 升序（同刻按编号）。
+
+        覆盖的判定：存在一个同群的窗口，其 ``started_at`` 与 ``ended_at`` **均非空**，且
+        这条消息的 ``sent_at`` 落在 ``[started_at, ended_at]``（含两端）之内。不区分窗口
+        状态——只要窗口记下了时间区间，这条消息就算有归属。
+
+        启动对账用它找出「重启时随内存缓冲一起丢掉、却因回补锚点而永远不会被提取」的消息
+        （见 :meth:`~rzyl_core.runtime.Runtime.reconcile_uncovered_messages`）。
+
+        **已知局限**：覆盖是按时间区间判定的，所以一条真正没进过管道的消息，如果它的
+        ``sent_at`` 恰好落在**别的**窗口的时间区间内，这里就检测不出来。之所以仍然够用，
+        是因为丢失的内存缓冲总是位于两个窗口之间的**空隙**里——那一段没有任何窗口盖住。
+        换言之：能检测到的是「时间上没有被任何窗口跨过的消息」，而不是「从未参与过任何
+        窗口的消息」；后者需要记录每条消息的处理归属，超出当前 ``window`` 表的表达能力。
+        """
+        # 相关子查询：同群、时间区间非空、且把本消息的 sent_at 夹在区间里。
+        covered = (
+            select(Window.id)
+            .where(Window.group_id == Message.group_id)
+            .where(Window.started_at.is_not(None))
+            .where(Window.ended_at.is_not(None))
+            .where(Message.sent_at >= Window.started_at)
+            .where(Message.sent_at <= Window.ended_at)
+            .exists()
+        )
+        statement = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .where(~covered)
+            .order_by(Message.sent_at, Message.id)
+            .limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
     async def existing_message_hashes(self, hashes: Sequence[str]) -> set[str]:
         """在给定的一批消息去重 hash 里，返回**库中已存在**的那些。
 

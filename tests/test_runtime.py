@@ -99,7 +99,8 @@ async def test_runtime_start_and_stop_own_the_repository(tmp_path: Path, clock: 
 async def test_runtime_background_task_skeletons_are_started_and_cancelled(
     tmp_path: Path, clock: _Clock
 ) -> None:
-    runtime = _runtime(tmp_path, clock)
+    # 关掉启动对账，专心验证四个常驻循环；对账任务另有 tests/test_reconcile.py 守着。
+    runtime = _runtime(tmp_path, clock, reconcile_on_startup=False)
 
     await runtime.start(run_background_tasks=True)
     # 四个常驻循环：保留期清理、向量补算、窗口超时刷新、死信重试。

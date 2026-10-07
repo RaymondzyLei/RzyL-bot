@@ -29,6 +29,10 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
 - **死信重试**（``retry_dead_windows``）：**已实现**。``_dead_letter_loop`` 周期找出
   状态为 ``dead`` 的窗口重跑；护栏与可观察性见 :meth:`Runtime.retry_dead_windows` 的
   文档字符串。间隔取 ``settings.dead_letter_retry_seconds``。
+- **启动对账**（``reconcile_uncovered_messages``）：**已实现**。``start()`` 打开
+  ``settings.reconcile_on_startup``（默认开）时，用一个一次性后台任务把「没有被任何窗口
+  时间区间覆盖」的消息重新送进窗口管道——补上「重启丢掉内存缓冲、而回补锚点又不会拉
+  已存消息」这个洞。任务不阻塞启动，登记进 ``self._tasks`` 供 ``stop()`` 取消。
 - 保留期清理与向量补算两个老循环的间隔仍是模块常量（``RETENTION_SWEEP_SECONDS`` /
   ``EMBEDDING_SWEEP_SECONDS``）；新增的两个循环按里程碑 2 的要求从设置读。
 
@@ -159,6 +163,46 @@ class ReplayReport:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class GroupReconcile:
+    """一个群的启动对账结果。"""
+
+    group_id: int
+    message_count: int
+    window_count: int
+    memory_ids: tuple[int, ...]
+    capped: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileReport:
+    """一次 :meth:`Runtime.reconcile_uncovered_messages` 的结果：按群明细加汇总视图。"""
+
+    groups: tuple[GroupReconcile, ...]
+
+    @property
+    def message_count(self) -> int:
+        """本批重新送进管道的消息总条数。"""
+        return sum(group.message_count for group in self.groups)
+
+    @property
+    def window_count(self) -> int:
+        """本批新成的窗口总数。"""
+        return sum(group.window_count for group in self.groups)
+
+    @property
+    def memory_ids(self) -> tuple[int, ...]:
+        """本批新增的记忆条目编号。"""
+        return tuple(
+            memory_id for group in self.groups for memory_id in group.memory_ids
+        )
+
+    @property
+    def capped_groups(self) -> tuple[int, ...]:
+        """触到 ``reconcile_max_messages`` 上限的群号（还有未覆盖消息留着）。"""
+        return tuple(group.group_id for group in self.groups if group.capped)
+
+
 class Runtime:
     """装配好的一整套服务：仓储、窗口组装、提取管道，外加生命周期与后台任务。"""
 
@@ -237,6 +281,14 @@ class Runtime:
                 asyncio.create_task(self._window_flush_loop(), name="rzyl-window-flush"),
                 asyncio.create_task(self._dead_letter_loop(), name="rzyl-dead-letter-retry"),
             ]
+            if self._settings.reconcile_on_startup:
+                # 一次性任务：启动时不阻塞（对账可能调几十次模型），跑完自己结束；
+                # 登记进 _tasks 只为 stop() 能取消它，不留下悬挂任务。
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._startup_reconcile(), name="rzyl-startup-reconcile"
+                    )
+                )
 
     async def stop(self) -> None:
         """取消后台任务、关仓储；对注入的模型，若它提供 ``aclose`` 也一并关闭。"""
@@ -618,6 +670,105 @@ class Runtime:
             except Exception:
                 logger.exception("死信重试失败，下一轮再试")
 
+    # —— 启动对账（里程碑 2）——
+
+    async def reconcile_uncovered_messages(
+        self, *, limit: int | None = None
+    ) -> ReconcileReport:
+        """把没有被任何窗口覆盖的消息重新送进窗口管道；每群处理完强制成窗。
+
+        **要解决的问题**（真机实测）：窗口缓冲只在内存里（见 ``pipeline/window.py``），
+        进程重启时未满的窗口会丢。那些消息**还在 ``message`` 表里**，但掉线回补的锚点是
+        「该群最后一条已存消息的时间」（``latest_message_sent_at``），已经存过的消息不会
+        再被拉回来，于是**永远不会被提取**。启动时按「``sent_at`` 不被任何同群窗口的
+        ``[started_at, ended_at]`` 覆盖」找出这批消息，重新成窗、提取、入库。
+
+        两个关键点：
+
+        - **不重复写 ``message`` 表**：这些消息已经在库里，直接把仓储对象交给组装器
+          （``WindowAssembler.add`` 会适配），于是 ``sequence_map`` 指向真实消息编号、
+          ``evidence`` 正确，不需要任何特殊处理。
+        - **用独立组装器**：实时采集（:meth:`ingest`）与后台刷新循环都在用
+          ``self._assembler``，它按群维护内存缓冲；若共用，两边同时往同一个群的缓冲里塞
+          消息会把窗口拼坏。这里用 :meth:`_build_assembler` 另建一个，缓冲互不干扰；
+          内容万一重叠，入库时的去重 hash 会挡掉。
+
+        每个群处理完调 ``flush_group`` 强制成窗——否则不足最小条数的尾巴会一直留在缓冲里，
+        对账就等于没做。``limit`` 缺省取 ``settings.reconcile_max_messages``（每群上限）；
+        触到上限记 ``WARNING``，剩下的留到下次启动或手动再调。
+
+        幂等：处理完后这些消息就落在新窗口的时间区间里，所以下一次启动应查出接近 0 条。
+        """
+        repository = self._require_repository()
+        pipeline = self._require_pipeline()
+        per_group_limit = self._settings.reconcile_max_messages if limit is None else limit
+        if per_group_limit <= 0:
+            logger.warning("启动对账：每群上限为 %d，跳过本轮", per_group_limit)
+            return ReconcileReport(groups=())
+        # 独立组装器，绝不碰 self._assembler（理由见文档字符串）。
+        assembler = self._build_assembler(repository, self._clock)
+        groups: list[GroupReconcile] = []
+        for group_id in sorted(await self.allowed_groups()):
+            # 多取一条只为准确判断「是否真的还有剩下的」，处理时再砍回上限。
+            fetched = await repository.list_uncovered_messages(
+                group_id=group_id, limit=per_group_limit + 1
+            )
+            capped = len(fetched) > per_group_limit
+            messages = fetched[:per_group_limit]
+            if not messages:
+                continue
+            outcomes: list[ExtractionOutcome] = []
+            for message in messages:
+                for window in await assembler.add(message):
+                    outcomes.append(await pipeline.process_window(window))
+            remainder = await assembler.flush_group(group_id)
+            if remainder is not None:
+                outcomes.append(await pipeline.process_window(remainder))
+            memory_ids = tuple(
+                memory_id for outcome in outcomes for memory_id in outcome.memory_ids
+            )
+            groups.append(
+                GroupReconcile(
+                    group_id=group_id,
+                    message_count=len(messages),
+                    window_count=len(outcomes),
+                    memory_ids=memory_ids,
+                    capped=capped,
+                )
+            )
+            logger.info(
+                "启动对账：群 %s 重新处理 %d 条未覆盖消息，成窗 %d 个，新增条目 %d 条",
+                group_id,
+                len(messages),
+                len(outcomes),
+                len(memory_ids),
+            )
+            if capped:
+                logger.warning(
+                    "启动对账：群 %s 未覆盖消息已达上限 %d 条，仍有未覆盖的消息留着；"
+                    "下次启动或手动调用 reconcile_uncovered_messages() 会继续处理",
+                    group_id,
+                    per_group_limit,
+                )
+        report = ReconcileReport(groups=tuple(groups))
+        logger.info(
+            "启动对账完成：%d 个群、%d 条消息、%d 个窗口、%d 条新增条目",
+            len(report.groups),
+            report.message_count,
+            report.window_count,
+            len(report.memory_ids),
+        )
+        return report
+
+    async def _startup_reconcile(self) -> None:
+        """启动对账的一次性后台任务：失败只记日志，不影响其余循环，也不阻塞启动。"""
+        try:
+            await self.reconcile_uncovered_messages()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("启动对账失败；未覆盖的消息留到下次启动或手动调用时再处理")
+
     # —— 离线回放 ——
 
     async def replay(
@@ -771,7 +922,9 @@ __all__ = [
     "EMBEDDING_SWEEP_SECONDS",
     "EMBED_PURPOSE",
     "RETENTION_SWEEP_SECONDS",
+    "GroupReconcile",
     "IngestResult",
+    "ReconcileReport",
     "ReplayReport",
     "Runtime",
     "get_runtime",
