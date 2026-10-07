@@ -447,6 +447,23 @@ class Repository:
             result = await session.execute(statement)
             return list(result.scalars().all())
 
+    async def latest_successful_llm_call_model(self, *, purpose: str) -> str | None:
+        """取某用途最近一次**成功**调用记录里的模型名；没有成功记录时返回 ``None``。
+
+        给运行时「向量模型账本一致性」检查用：维度守卫只挡得住维度变化，同维度的不同
+        模型（例如两个都是 1024 维的向量模型）混在一张表里，任何长度检查都看不出来，
+        只能靠模型名记账来发现。
+        """
+        statement = (
+            select(LlmCall.model)
+            .where(LlmCall.purpose == purpose, LlmCall.success.is_(True))
+            .order_by(LlmCall.created_at.desc(), LlmCall.id.desc())
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return result.scalars().first()
+
     async def add_feedback(
         self,
         *,

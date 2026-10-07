@@ -17,6 +17,7 @@ import pytest
 
 from rzyl_core.llm import DeterministicEmbedding
 from rzyl_core.llm.fakes import EchoChatModel
+from rzyl_core.llm.prompts import DEFAULT_PROMPT_VERSION
 from rzyl_core.pipeline.history import OneBotHistorySource, SampleHistorySource
 from rzyl_core.runtime import Runtime
 from rzyl_core.settings import Settings
@@ -166,7 +167,7 @@ async def test_dry_run_prints_the_prompt_and_raw_output_without_writing(tmp_path
         assert await repository.list_group_memories(group_id=GROUP) == []
         assert await repository.list_messages(group_id=GROUP) == []
         assert await repository.list_llm_calls() == []
-        assert report.previews[0].rendered.version == "v1"
+        assert report.previews[0].rendered.version == DEFAULT_PROMPT_VERSION
     finally:
         await runtime.stop()
 

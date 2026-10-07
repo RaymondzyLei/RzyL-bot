@@ -19,7 +19,9 @@ def test_default_version_is_available_and_versioned() -> None:
     template = get_prompt_template()
     assert template.version == DEFAULT_PROMPT_VERSION
     assert template.version in PROMPT_VERSIONS
-    assert template.version == "v1"
+    # 加了 v2 之后默认切到 v2；v1 仍要可按版本取到（已入库条目记着 prompt_version=v1）。
+    assert template.version == "v2"
+    assert "v1" in PROMPT_VERSIONS
 
 
 def test_template_exposes_text_and_placeholders() -> None:
@@ -75,3 +77,17 @@ def test_v1_states_the_judgement_rules() -> None:
         "空数组",  # 没有值得记的返回空数组
     ):
         assert phrase in text, f"提示词 v1 缺少判据措辞：{phrase}"
+
+
+def test_v2_tells_the_model_how_the_supersedes_anchor_is_written() -> None:
+    """v2 必须把「摘要里是 [#N]、你填不带 # 的整数、没有就 null、别用数组」讲清楚。"""
+    template = get_prompt_template("v2")
+    text = template.system + template.user_template
+
+    assert "[#" in text  # 与渲染出来的锚点形式对上
+    assert "不带" in text and "#" in text
+    assert "null" in text
+    assert "不要填数组" in text
+    # v2 沿用 v1 的判据，不只是改了 supersedes 一行。
+    for phrase in ("可复用", "resource", "evidence", "空数组", "没有「其他」"):
+        assert phrase in text, f"提示词 v2 丢了判据措辞：{phrase}"
