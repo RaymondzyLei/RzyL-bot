@@ -161,7 +161,9 @@ async def test_flush_expired_closes_a_quiet_window_through_the_pipeline(
     runtime = _runtime(tmp_path, clock, window_message_limit=30)
     await runtime.start(run_background_tasks=False)
     try:
-        await runtime.ingest(group_id=GROUP, user_id=USER, text="一个人说话", sent_at=BEGIN)
+        # 时间规则要求缓冲里有 window_min_messages 条，先攒够 5 条再等时间到点。
+        for index in range(5):
+            await runtime.ingest(group_id=GROUP, user_id=USER, text=f"第{index}条", sent_at=BEGIN)
         assert await runtime.flush_expired() == ()
 
         clock.advance(6)
@@ -675,7 +677,9 @@ async def test_window_flush_loop_body_closes_a_quiet_window(tmp_path: Path, cloc
     runtime = _runtime(tmp_path, clock, window_message_limit=30, window_flush_seconds=1)
     await runtime.start(run_background_tasks=False)
     try:
-        await runtime.ingest(group_id=GROUP, user_id=USER, text="安静了", sent_at=BEGIN)
+        # 攒够最小条数，再让注入时钟跨过 window_minutes。
+        for index in range(5):
+            await runtime.ingest(group_id=GROUP, user_id=USER, text=f"第{index}条", sent_at=BEGIN)
         assert await runtime.flush_expired() == ()
 
         clock.advance(6)
