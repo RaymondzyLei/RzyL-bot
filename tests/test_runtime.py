@@ -99,12 +99,19 @@ async def test_runtime_start_and_stop_own_the_repository(tmp_path: Path, clock: 
 async def test_runtime_background_task_skeletons_are_started_and_cancelled(
     tmp_path: Path, clock: _Clock
 ) -> None:
-    # 关掉启动对账，专心验证四个常驻循环；对账任务另有 tests/test_reconcile.py 守着。
+    # 关掉启动对账，专心验证五个常驻循环；对账任务另有 tests/test_reconcile.py 守着。
     runtime = _runtime(tmp_path, clock, reconcile_on_startup=False)
 
     await runtime.start(run_background_tasks=True)
-    # 四个常驻循环：保留期清理、向量补算、窗口超时刷新、死信重试。
-    assert len(runtime.background_tasks) == 4
+    # 五个常驻循环：保留期清理、向量补算、窗口超时刷新、死信重试、每日推送。
+    # 断言名字集合而不是条数：名字变了要能一眼看出是哪个循环，条数变了只会看到一个数字。
+    assert {task.get_name() for task in runtime.background_tasks} == {
+        "rzyl-retention-sweep",
+        "rzyl-embedding-backfill",
+        "rzyl-window-flush",
+        "rzyl-dead-letter-retry",
+        "rzyl-daily-push",
+    }
     assert all(not task.done() for task in runtime.background_tasks)
 
     await runtime.stop()
@@ -552,6 +559,36 @@ async def test_ingest_message_accepts_a_group_enabled_only_at_runtime(
         )
 
         assert result is not None
+    finally:
+        await runtime.stop()
+
+
+async def test_pausing_a_whitelisted_group_really_stops_collecting_it(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """故事 2：在私聊里发命令就能暂停某个群，而不用改配置重启容器。
+
+    暂停必须压过配置白名单，否则对一个写在 ``RZYL_GROUP_WHITELIST`` 里的群，
+    ``记忆 暂停`` 是个空操作——这比没有这个命令更糟。
+    """
+    other = GROUP + 1
+    runtime = _runtime(tmp_path, clock, group_whitelist=[GROUP, other])
+    await runtime.start(run_background_tasks=False)
+    try:
+        assert await runtime.allowed_groups() == frozenset({GROUP, other})
+
+        await runtime.repository.set_group_enabled(GROUP, False)
+
+        assert await runtime.allowed_groups() == frozenset({other})
+        result = await runtime.ingest_message(
+            group_id=GROUP,
+            user_id=USER,
+            self_id=999,
+            segments=_segments({"type": "text", "data": {"text": "暂停后不该再收"}}),
+            sent_at=BEGIN,
+        )
+        assert result is None
+        assert await runtime.repository.list_messages() == []
     finally:
         await runtime.stop()
 

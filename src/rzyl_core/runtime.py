@@ -33,8 +33,17 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
   ``settings.reconcile_on_startup``（默认开）时，用一个一次性后台任务把「没有被任何窗口
   时间区间覆盖」的消息重新送进窗口管道——补上「重启丢掉内存缓冲、而回补锚点又不会拉
   已存消息」这个洞。任务不阻塞启动，登记进 ``self._tasks`` 供 ``stop()`` 取消。
+- **每日推送**（``push_daily_report_if_due``）：**已实现**。``start()`` 拉起
+  ``_daily_push_loop``，按 ``settings.push_hour/push_minute``（``settings.timezone`` 计）
+  到点触发：**先强制关窗**、再按类别渲染当天条目，交给已登记的投递器（``memory.push``）。
+  core 不认识 QQ，所以发送这件事由插件登记进来；没登记就只记一条告警，绝不假装发出去了。
 - 保留期清理与向量补算两个老循环的间隔仍是模块常量（``RETENTION_SWEEP_SECONDS`` /
-  ``EMBEDDING_SWEEP_SECONDS``）；新增的两个循环按里程碑 2 的要求从设置读。
+  ``EMBEDDING_SWEEP_SECONDS``）；新增的三个循环按里程碑 2 的要求从设置读。
+
+里程碑 3 还给了 Runtime 三样出口，供插件与脚本消费记忆：``execute_command``（一条命令
+进、一段私聊文本出）、``build_daily_report``（关窗 + 渲染，不负责发送）、
+``search_memories``（混合检索）。三者都只是把 :mod:`rzyl_core.memory` 里的实现接上来，
+Runtime 依旧是**唯一对外入口**。
 
 回放有两个模式，差别只在**写与不写**：
 
@@ -50,6 +59,7 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import tempfile
@@ -61,6 +71,11 @@ from typing import Any, TypeVar
 
 from rzyl_core.db import Message, Repository, Window, WindowStatus
 from rzyl_core.llm import ChatModel, EmbeddingModel, embed_batch
+from rzyl_core.memory.commands import CommandResult, MemoryCommand
+from rzyl_core.memory.console import MemoryConsole
+from rzyl_core.memory.push import get_report_sender, next_push_at, schedule_push_at
+from rzyl_core.memory.report import DailyReport, render_daily_report
+from rzyl_core.memory.retrieval import DEFAULT_SEARCH_LIMIT, RetrievalOutcome, hybrid_search
 from rzyl_core.pipeline.collector import collect, merge_allowed_groups
 from rzyl_core.pipeline.extract import ExtractionOutcome, ExtractionPipeline, PreviewOutcome
 from rzyl_core.pipeline.history import HistorySource, HistoryMessage, message_dedupe_hash
@@ -73,7 +88,7 @@ from rzyl_core.pipeline.window import (
     assemble_window,
 )
 from rzyl_core.settings import Settings
-from rzyl_core.timeutil import utcnow
+from rzyl_core.timeutil import local_day_bounds, resolve_timezone, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +97,27 @@ RETENTION_SWEEP_SECONDS = 3600
 
 #: 向量补算循环的间隔（秒）。
 EMBEDDING_SWEEP_SECONDS = 300
+
+#: 每日推送循环醒来检查「到点没有」的间隔（秒）。
+#:
+#: 推送本身是每分钟才需要判一次的事，但用 30 秒是刻意的余量：真实推送要跑
+#: ``flush_pending``（会调模型，可能几十秒），醒来晚一点就会把「每天 22:00」拖成 22:05。
+PUSH_TICK_SECONDS = 30
+
+#: 一次日报最多从库里取多少条。取一个宽松的上限只为防某天刷屏把整库拉进内存。
+DAILY_REPORT_FETCH_LIMIT = 500
+
+#: 日报投递失败后多久重试一次（秒）。
+PUSH_RETRY_SECONDS = 600
+
+#: 一份日报最多尝试投递几次；到顶就放弃到明天。最常见的失败原因是这一刻 QQ 没连上。
+PUSH_MAX_ATTEMPTS = 3
+
+#: 启动时的宽限：若启动时刻落在今天推送时刻之后的这段时间内，立刻补推一次。
+#:
+#: 推送循环每 30 秒才醒一次，所以「22:00:15 启动」会让严格的下一次变成明天——当天整份
+#: 不推且毫无提示。宁可此时多推一份（重启前刚推过会重复），也不静默丢掉一天的日报。
+PUSH_STARTUP_GRACE_SECONDS = 900
 
 #: 一次向量补算最多处理多少条，避免一次拉太多进内存。
 EMBEDDING_BACKFILL_BATCH = 100
@@ -231,8 +267,14 @@ class Runtime:
         self._repository: Repository | None = None
         self._assembler: WindowAssembler | None = None
         self._pipeline: ExtractionPipeline | None = None
+        self._console: MemoryConsole | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._started = False
+        #: 下一次该推送的 UTC 时刻；``start()`` 后第一次醒来时才排定。
+        self._next_push_at: datetime | None = None
+        #: 本次日报已经投递失败了几次，用于给重试封顶。
+        self._push_attempts = 0
+        self._timezone = resolve_timezone(settings.timezone)
         #: 「向量模型账本一致性」检查同一进程内只做一次，免得后台循环每轮刷屏。
         self._embedding_ledger_checked = False
         self._embedding_ledger_model: str | None = None
@@ -270,6 +312,7 @@ class Runtime:
         self._repository = await Repository.create(self._database_url, clock=self._clock)
         self._assembler = self._build_assembler(self._repository, self._clock)
         self._pipeline = self._build_pipeline(self._repository, self._clock)
+        self._console = self._build_console(self._repository)
         self._started = True
         # 启动时核对一次向量模型账本：换过模型却没重算向量的库要尽早出声，而不是等到
         # 去重结果开始离谱。同一进程只提醒一次，后台循环不会重复刷屏。
@@ -280,6 +323,7 @@ class Runtime:
                 asyncio.create_task(self._embedding_loop(), name="rzyl-embedding-backfill"),
                 asyncio.create_task(self._window_flush_loop(), name="rzyl-window-flush"),
                 asyncio.create_task(self._dead_letter_loop(), name="rzyl-dead-letter-retry"),
+                asyncio.create_task(self._daily_push_loop(), name="rzyl-daily-push"),
             ]
             if self._settings.reconcile_on_startup:
                 # 一次性任务：启动时不阻塞（对账可能调几十次模型），跑完自己结束；
@@ -303,6 +347,9 @@ class Runtime:
         self._repository = None
         self._assembler = None
         self._pipeline = None
+        self._console = None
+        self._next_push_at = None
+        self._push_attempts = 0
         self._started = False
         for model in (self._chat, self._embedding):
             await _close_if_possible(model)
@@ -350,14 +397,17 @@ class Runtime:
         )
 
     async def allowed_groups(self) -> frozenset[int]:
-        """当前允许采集的群号：设置里的白名单 **并上** 数据库里的每群运行开关。
+        """当前允许采集的群号：``(配置白名单 − 显式暂停) ∪ 显式开启``。
 
-        两个来源缺一不可——配置文件给初始值，里程碑 3 的开关命令写数据库；这里取并集，
-        判定与插件启动日志都用它。
+        配置给初始值，里程碑 3 的 ``记忆 开启 / 暂停`` 写数据库里的每群开关。**数据库里
+        有行的群以那一行为准**——暂停必须能压过配置白名单，否则命令是空操作（见
+        :func:`~rzyl_core.pipeline.collector.merge_allowed_groups`）。
         """
         repository = self._require_repository()
         return merge_allowed_groups(
-            self._settings.group_whitelist, await repository.enabled_groups()
+            self._settings.group_whitelist,
+            await repository.enabled_groups(),
+            await repository.disabled_groups(),
         )
 
     async def ingest_message(
@@ -413,6 +463,176 @@ class Runtime:
         pipeline = self._require_pipeline()
         windows = await assembler.flush_expired()
         return tuple([await pipeline.process_window(window) for window in windows])
+
+    async def flush_pending(self, group_id: int | None = None) -> int:
+        """**不管满没满**，把缓冲里的窗口立刻关掉并走提取，返回关掉的窗口数。
+
+        与 :meth:`flush_expired` 的区别就在「不管满没满」：到点才关是定时刷新的语义，
+        而这里要的是「现在就要看到全部」——查当天条目与发日报前都要先跑一次，
+        否则最近一两个小时的内容还躺在内存缓冲里，日报会漏（见 issue #1 的推送约束）。
+
+        ``group_id`` 给定就只关那个群，缺省关所有有缓冲的群。代价要说清楚：每个被关的
+        窗口都是一次真实的模型调用，所以调用方应当把关了几个窗口如实告诉用户。
+        """
+        assembler = self._require_assembler()
+        pipeline = self._require_pipeline()
+        groups = [group_id] if group_id is not None else assembler.pending_groups()
+        closed = 0
+        for target in groups:
+            window = await assembler.flush_group(target)
+            if window is None:
+                continue
+            outcome = await pipeline.process_window(window)
+            closed += 1
+            if outcome.status is WindowStatus.DEAD:
+                logger.warning(
+                    "强制关窗：群 %s 的窗口 %s 进了死信（%s），后台会重试",
+                    target,
+                    outcome.window_id,
+                    outcome.error,
+                )
+        if closed:
+            logger.info("强制关窗：关掉 %d 个窗口（群 %s）", closed, groups)
+        return closed
+
+    # —— 记忆出口（里程碑 3）——
+
+    async def execute_command(self, command: MemoryCommand) -> CommandResult:
+        """执行一条已解析的记忆命令，返回要发回私聊的文本。
+
+        Runtime 只做转交：真正的实现在 :class:`~rzyl_core.memory.console.MemoryConsole`，
+        它拿的是这个 Runtime 的仓储、向量实现与「强制关窗」回调。这样命令逻辑不必持有
+        装配状态，也能脱离 Runtime 单测。
+        """
+        if self._console is None:
+            raise RuntimeError("Runtime 尚未 start()，记忆命令不可用")
+        return await self._console.execute(command)
+
+    async def search_memories(
+        self, query: str, *, limit: int = DEFAULT_SEARCH_LIMIT
+    ) -> RetrievalOutcome:
+        """混合检索（关键词 + 语义，RRF 融合）。离线脚本与验收用它。"""
+        repository = self._require_repository()
+        return await hybrid_search(
+            repository=repository,
+            embedding=self._embedding,
+            query=query,
+            min_similarity=self._settings.retrieval_min_similarity,
+            limit=limit,
+        )
+
+    async def build_daily_report(self, now: datetime | None = None) -> DailyReport:
+        """关掉全部未满窗口，再把「当天」的活跃条目渲染成一份日报（**不负责发送**）。
+
+        「当天」按 ``settings.timezone`` 的自然日算，落在 ``memory.created_at`` 上。
+
+        发送为什么不在这一层：core 不认识 QQ（见 ``memory.push``）。投递器由插件登记，
+        :meth:`push_daily_report_if_due` 才负责到点触发并调用它。
+        """
+        repository = self._require_repository()
+        moment = now or self._clock()
+        flushed = await self.flush_pending()
+        since, until = local_day_bounds(moment, self._timezone)
+        memories = await repository.list_memories_in_range(
+            since=since, until=until, limit=DAILY_REPORT_FETCH_LIMIT
+        )
+        report = render_daily_report(
+            memories,
+            day=moment.astimezone(self._timezone).date(),
+            threshold=self._settings.confidence_threshold,
+            max_entries=self._settings.push_max_entries,
+            flushed_windows=flushed,
+        )
+        logger.info(
+            "日报已生成：%s，列出 %d/%d 条（低置信度 %d 条未列），推送前补关 %d 个窗口",
+            report.day.isoformat(),
+            report.listed,
+            report.total,
+            report.low_confidence,
+            flushed,
+        )
+        return report
+
+    async def push_daily_report_if_due(self, now: datetime | None = None) -> DailyReport | None:
+        """到点就生成并投递日报；没到点返回 ``None``。
+
+        「到点」由 :func:`~rzyl_core.memory.push.next_push_at` 算，只看 ``settings.timezone``
+        的墙上时间。第一次调用时排定下一次；**先排下一班再干活**——生成日报会调模型、
+        可能花掉几十秒，排班不能被它拖后。
+
+        投递失败会**在当天重试**（``PUSH_RETRY_SECONDS`` 一次、至多 ``PUSH_MAX_ATTEMPTS``
+        次）而不是等到明天：最常见的失败原因是这一刻 QQ 没连上（NapCat 掉线、正在重启），
+        十分钟后可能就好了。重试到顶就放弃并记一条告警——不会整夜每十分钟刷一条异常。
+
+        三种结果都留痕：没登记投递器（告警，并说清「生成了但没发出去」）、投递失败
+        （异常日志 + 重试）、投递成功（INFO）。
+        """
+        if not self._settings.push_enabled:
+            return None
+        moment = now or self._clock()
+        if self._next_push_at is None:
+            self._next_push_at = schedule_push_at(
+                moment,
+                hour=self._settings.push_hour,
+                minute=self._settings.push_minute,
+                tz=self._timezone,
+                startup_grace_seconds=PUSH_STARTUP_GRACE_SECONDS,
+            )
+            logger.info(
+                "每日推送已排定：下一次 %s（%s）",
+                self._next_push_at.astimezone(self._timezone).isoformat(),
+                self._settings.timezone,
+            )
+        if moment < self._next_push_at:
+            return None
+        self._next_push_at = next_push_at(
+            moment,
+            hour=self._settings.push_hour,
+            minute=self._settings.push_minute,
+            tz=self._timezone,
+        )
+        report = await self.build_daily_report(moment)
+        sender = get_report_sender()
+        if sender is None:
+            logger.warning(
+                "日报已生成但没登记投递器（插件没加载？），本次没有发出去：共 %d 条",
+                report.total,
+            )
+            return report
+        try:
+            await sender(report)
+        except Exception:
+            self._push_attempts += 1
+            if self._push_attempts < PUSH_MAX_ATTEMPTS:
+                self._next_push_at = moment + timedelta(seconds=PUSH_RETRY_SECONDS)
+                logger.exception(
+                    "日报投递失败（共 %d 条，第 %d/%d 次）：%d 秒后重试",
+                    report.total,
+                    self._push_attempts,
+                    PUSH_MAX_ATTEMPTS,
+                    PUSH_RETRY_SECONDS,
+                )
+            else:
+                logger.exception(
+                    "日报投递连续失败 %d 次（共 %d 条），本次放弃，明天再推",
+                    self._push_attempts,
+                    report.total,
+                )
+            return report
+        self._push_attempts = 0
+        logger.info("日报已投递：%s，列出 %d 条", report.day.isoformat(), report.listed)
+        return report
+
+    async def _daily_push_loop(self) -> None:
+        """每 ``PUSH_TICK_SECONDS`` 醒一次问到点没有；单轮失败不退循环。"""
+        while True:
+            await asyncio.sleep(PUSH_TICK_SECONDS)
+            try:
+                await self.push_daily_report_if_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("每日推送失败，下一轮再试")
 
     # —— 后台任务：保留期清理 ——
 
@@ -900,6 +1120,16 @@ class Runtime:
             provider=self._provider,
         )
 
+    def _build_console(self, repository: Repository) -> MemoryConsole:
+        """装配命令执行器；「强制关窗」用 partial 绑到本实例的方法上。"""
+        return MemoryConsole(
+            repository=repository,
+            embedding=self._embedding,
+            settings=self._settings,
+            clock=self._clock,
+            flush_pending=functools.partial(self.flush_pending),
+        )
+
     def _require_repository(self) -> Repository:
         if self._repository is None:
             raise RuntimeError("Runtime 尚未 start()，仓储不可用")
@@ -917,10 +1147,12 @@ class Runtime:
 
 
 __all__ = [
+    "DAILY_REPORT_FETCH_LIMIT",
     "DEAD_LETTER_RETRY_BATCH",
     "EMBEDDING_BACKFILL_BATCH",
     "EMBEDDING_SWEEP_SECONDS",
     "EMBED_PURPOSE",
+    "PUSH_TICK_SECONDS",
     "RETENTION_SWEEP_SECONDS",
     "GroupReconcile",
     "IngestResult",

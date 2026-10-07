@@ -37,8 +37,7 @@ import math
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 from sqlalchemy.exc import SQLAlchemyError
@@ -63,6 +62,7 @@ from rzyl_core.llm import (
 from rzyl_core.llm.prompts import RenderedPrompt
 from rzyl_core.pipeline.window import AssembledWindow, UnknownSequenceError
 from rzyl_core.settings import Settings
+from rzyl_core.timeutil import resolve_timezone
 
 #: 聊天调用写进 ``llm_call.purpose`` 的用途标签。
 LLM_PURPOSE = "extract"
@@ -305,12 +305,6 @@ class PreviewOutcome:
     model: str | None = None
 
 
-def _tzinfo(name: str):
-    """把设置里的时区名解析成 tzinfo；认不出来就退回 UTC，不因此中断提取。"""
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        return timezone.utc
 
 
 class ExtractionPipeline:
@@ -337,7 +331,7 @@ class ExtractionPipeline:
         self._settings = settings
         self._clock = clock
         self._provider = provider
-        self._timezone = _tzinfo(settings.timezone)
+        self._timezone = resolve_timezone(settings.timezone)
 
     async def process_window(
         self, window: AssembledWindow, *, window_id: int | None = None

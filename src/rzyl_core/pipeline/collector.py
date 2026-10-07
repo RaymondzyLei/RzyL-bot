@@ -6,8 +6,11 @@
 三件事：
 
 - :func:`merge_allowed_groups` —— 白名单来源是**两个**：设置里的 ``group_whitelist``
-  （配置的初始值）与数据库里的每群开关（``Repository.enabled_groups``，里程碑 3 的命令
-  会写它）。两者取**并集**：配置里有的群默认收，运行时开过的群也收。
+  （配置的初始值）与数据库里的每群开关（``Repository.enabled_groups`` /
+  ``disabled_groups``，里程碑 3 的命令会写它）。**数据库里有行的群以那一行为准**：
+  显式开启的群加入，显式关掉的群从配置白名单里**摘掉**。这一条不能少——不然
+  ``记忆 暂停 <群号>`` 对一个写在 ``RZYL_GROUP_WHITELIST`` 里的群就是个空操作，
+  而「暂停不生效」比「没有这个命令」更糟。
 - :func:`render_segments` —— OB11 消息段数组 → ``(text, segments_json)``。文本段拼成
   文本；``image`` / ``record`` / ``video`` / ``file`` / ``forward`` 等非文本段在文本里
   落成可读占位符，保证「你们看这张图」后面不断层；``at`` 渲染成 ``@某人``，绝不把 CQ 码
@@ -59,10 +62,16 @@ class RenderedSegments:
 
 
 def merge_allowed_groups(
-    configured: Collection[int], enabled: Collection[int]
+    configured: Collection[int],
+    enabled: Collection[int],
+    disabled: Collection[int] = (),
 ) -> frozenset[int]:
-    """把配置白名单与运行时开关合并成一份群号集合（并集，去重）。"""
-    return frozenset(configured) | frozenset(enabled)
+    """把配置白名单与运行时开关合并成一份群号集合。
+
+    规则：``(配置 − 显式关掉) ∪ 显式开启``。``disabled`` 缺省为空，所以「还没有任何
+    运行时开关」时它退化成「配置白名单 ∪ 运行时开过的群」，与里程碑 2 的行为一致。
+    """
+    return (frozenset(configured) | frozenset(enabled)) - frozenset(disabled)
 
 
 def _at_target(data: dict[str, Any]) -> str:

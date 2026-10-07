@@ -27,3 +27,6 @@ handoff/
 data/
 
 .pytest_cache/
+
+# ZCode 工具自己的忽略清单（每台机器各自生成），不是项目文件
+.zcodeignore

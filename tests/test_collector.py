@@ -1,6 +1,6 @@
 """采集判定与消息文本化的行为测试（里程碑 2）。
 
-seam 是 ``rzyl_core.pipeline.collector`` 的四个纯函数：白名单并集、段落渲染、
+seam 是 ``rzyl_core.pipeline.collector`` 的四个纯函数：白名单合并、段落渲染、
 接收判定、以及「判定 + 渲染」的组合。它们没有依赖（不读库、不联网），所以直接断言；
 插件只负责把 OneBot 事件的几样字段拆进来。
 """
@@ -18,7 +18,7 @@ from rzyl_core.pipeline.collector import (
     should_collect,
 )
 
-# —— 白名单并集 ——
+# —— 白名单合并 ——
 
 
 def test_merge_allowed_groups_is_the_union_of_config_and_runtime_switch() -> None:
@@ -29,6 +29,21 @@ def test_merge_allowed_groups_is_the_union_of_config_and_runtime_switch() -> Non
 def test_merge_allowed_groups_drops_duplicates_and_accepts_empty() -> None:
     assert merge_allowed_groups([], []) == frozenset()
     assert merge_allowed_groups([100, 100], []) == frozenset({100})
+
+
+def test_pausing_a_group_masks_the_configured_whitelist() -> None:
+    """里程碑 3 的关键语义：数据库里有行的群以那一行为准。
+
+    不这样，``记忆 暂停 <群号>`` 对一个写在 ``RZYL_GROUP_WHITELIST`` 里的群就是空操作，
+    而「暂停不生效」比「没有这个命令」更糟。默认 ``disabled`` 为空，所以旧的并集语义
+    没有变。
+    """
+    assert merge_allowed_groups([100, 200], [], [200]) == frozenset({100})
+    assert merge_allowed_groups([100], [200], [200]) == frozenset({100})
+    assert merge_allowed_groups([], [200], [200, 300]) == frozenset()
+    # 同一个群在库里只有一行，所以 enabled 与 disabled 不会同时含它——`− disabled` 只可能
+    # 摘掉来自配置白名单的群。
+    assert merge_allowed_groups([100], [], [100, 999]) == frozenset()
 
 
 # —— 段落文本化 ——

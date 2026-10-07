@@ -297,8 +297,8 @@ async def test_startup_reconcile_runs_as_a_registered_background_task(
     await runtime.start(run_background_tasks=True)
     try:
         tasks = runtime.background_tasks
-        # 四个常驻循环 + 一个一次性对账任务。
-        assert len(tasks) == 5
+        # 五个常驻循环 + 一个一次性对账任务。
+        assert len(tasks) == 6
         assert "rzyl-startup-reconcile" in {task.get_name() for task in tasks}
     finally:
         await runtime.stop()
@@ -336,8 +336,8 @@ async def test_startup_reconcile_is_skipped_when_disabled(
     await runtime.start(run_background_tasks=True)
     try:
         await asyncio.sleep(0.05)
-        # 开关关掉：没有对账任务，四个常驻循环照常。
-        assert len(runtime.background_tasks) == 4
+        # 开关关掉：没有对账任务，五个常驻循环照常（里程碑 3 起多了每日推送那个）。
+        assert len(runtime.background_tasks) == 5
         assert "rzyl-startup-reconcile" not in {
             task.get_name() for task in runtime.background_tasks
         }

@@ -5,12 +5,16 @@
 
     plugins/memory_bridge → rzyl_core     （插件可以依赖 core，core 不依赖插件）
 
-两个入口：
+四个入口：
 
 - ``on_message``（低优先级、**不 block**）——把群消息交给 ``Runtime.ingest_message``。
   不 block 是为了不影响 echo 等已有插件；低优先级让它排在别人后面。
 - ``driver.on_bot_connect``——机器人启动 / 掉线重连后：打一条白名单与可用群列表的日志，
   再对白名单里的群做一次掉线回补（见 :mod:`.backfill`）。
+- :mod:`.commands`——私聊里的 ``记忆 …`` 命令，只在私聊、只对超管。
+- :mod:`.push`——日报投递器，把 core 渲染好的文本发给超管。
+
+后两个子模块**在 import 时就完成注册**（命令响应器、日报投递器），所以它们在下面被导入。
 
 Runtime 由 ``bot.py`` 装配后通过 ``rzyl_core.runtime.set_runtime`` 注册，插件用
 ``get_runtime_or_none()`` 取。记忆功能因缺少密钥未启用时注册的是 ``None``，插件静默
@@ -31,12 +35,14 @@ from nonebot.plugin import PluginMetadata
 
 from rzyl_core.runtime import get_runtime_or_none
 
+# 这两个子模块靠 import 的副作用完成注册（命令响应器、日报投递器），必须导入。
+from . import commands, push  # noqa: F401
 from .backfill import backfill_all_groups, group_ids_from_group_list
 
 __plugin_meta__ = PluginMetadata(
     name="记忆桥",
-    description="把白名单群的消息交给 rzyl_core 记忆管道，并在掉线重连后回补。",
-    usage="无需命令：由 bot.py 装配 Runtime 后自动工作。",
+    description="把白名单群的消息交给 rzyl_core 记忆管道，提供私聊命令与每日日报。",
+    usage="群里自动采集；私聊发「记忆」看用法（仅超管）。",
     type="application",
     supported_adapters={"~onebot.v11"},
 )

@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     push_minute: int = 0
     """每日推送时刻的分钟（0-59）。"""
 
+    push_enabled: bool = True
+    """是否启用每日定时推送。关掉后只剩手动查询与命令可用。"""
+
+    push_max_entries: int = 50
+    """一条日报最多列多少条；超出的会在末尾说明，不静默截断。"""
+
     confidence_threshold: float = 0.7
     """推送时只列不低于该置信度的条目；入库不设门槛。"""
 
@@ -80,6 +86,17 @@ class Settings(BaseSettings):
 
     dedupe_similarity_threshold: float = 0.92
     """向量余弦去重阈值：同群同类别且相似度不低于它，新条目标为疑似重复。"""
+
+    retrieval_min_similarity: float = 0.35
+    """语义检索的相似度下限：余弦低于它的候选不参与 RRF 融合。
+
+    与 ``dedupe_similarity_threshold`` 是**两个不同的旋钮**，别混：去重那个是在问
+    「这两条是不是同一件事」（要严，0.92），这个是在问「这条跟查询词有没有关系」（要松）。
+
+    没有下限的话，向量那一路永远排得出一串候选，「搜什么都能搜到东西」，用户就没法用
+    检索结果判断「我到底记没记过这件事」。**这个值是待校准的**：先用一个保守的初值，
+    接入真实向量模型后用实际分布回来调（真机上打印几个已知相关 / 不相关样本对的余弦）。
+    """
 
     timezone: str = "Asia/Shanghai"
     """自然日与推送时刻所依据的时区。"""

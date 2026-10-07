@@ -15,6 +15,7 @@ import pytest
 
 from rzyl_core.db import (
     Category,
+    FeedbackKind,
     MemoryStatus,
     Repository,
     WindowStatus,
@@ -482,3 +483,203 @@ async def test_existing_message_hashes_reports_only_known_hashes(repo: Repositor
 
     assert found == {"h2"}
     assert await repo.existing_message_hashes([]) == set()
+
+
+# —— 里程碑 3 追加的读与清空 API ——
+
+
+async def test_list_memories_in_range_filters_by_time_and_status(repo: Repository) -> None:
+    repo.clock = lambda: datetime(2026, 10, 7, 10, 0, tzinfo=timezone.utc)
+    active = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="今天的结论",
+        confidence=0.9, prompt_version="v2",
+    )
+    suspect = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="今天的疑似重复",
+        confidence=0.9, prompt_version="v2", status=MemoryStatus.SUSPECT_DUPLICATE,
+    )
+    expired = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="今天的过期条目",
+        confidence=0.9, prompt_version="v2", status=MemoryStatus.EXPIRED,
+    )
+    repo.clock = lambda: datetime(2026, 10, 8, 10, 0, tzinfo=timezone.utc)
+    await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="明天的结论",
+        confidence=0.9, prompt_version="v2",
+    )
+
+    window = (
+        datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc),
+    )
+    default = await repo.list_memories_in_range(since=window[0], until=window[1])
+    everything = await repo.list_memories_in_range(
+        since=window[0], until=window[1], statuses=()
+    )
+    non_expired = await repo.list_memories_in_range(
+        since=window[0],
+        until=window[1],
+        statuses=(MemoryStatus.ACTIVE, MemoryStatus.SUSPECT_DUPLICATE),
+    )
+
+    assert [m.id for m in default] == [active.id]
+    assert {m.id for m in everything} == {active.id, suspect.id, expired.id}
+    assert {m.id for m in non_expired} == {active.id, suspect.id}
+
+
+async def test_list_memories_in_range_is_half_open_at_the_upper_bound(repo: Repository) -> None:
+    """左闭右开：正好落在右端点上的条目属于下一天，不属于这一天。"""
+    boundary = datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)
+    repo.clock = lambda: boundary
+    await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="午夜整点那条",
+        confidence=0.9, prompt_version="v2",
+    )
+
+    in_day = await repo.list_memories_in_range(
+        since=datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc), until=boundary
+    )
+    next_day = await repo.list_memories_in_range(since=boundary, until=None)
+
+    assert in_day == []
+    assert len(next_day) == 1
+
+
+async def test_list_memories_by_id_keeps_the_requested_order(repo: Repository) -> None:
+    first = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="甲",
+        confidence=0.9, prompt_version="v2",
+    )
+    second = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="乙",
+        confidence=0.9, prompt_version="v2",
+    )
+
+    ordered = await repo.list_memories_by_id([int(second.id), int(first.id), 999])
+
+    assert [m.statement for m in ordered] == ["乙", "甲"]
+    assert await repo.list_memories_by_id([]) == []
+
+
+async def test_memories_can_be_filtered_by_person(repo: Repository) -> None:
+    """相关人是 JSON 快照，所以这条也在验 ``json_each`` 那条查询真的成立。"""
+    await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="小明说的",
+        confidence=0.9, prompt_version="v2",
+        person_refs=[{"user_id": 10001, "nickname_snapshot": "小明"}],
+    )
+    await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="小红说的",
+        confidence=0.9, prompt_version="v2",
+        person_refs=[{"user_id": 10002, "nickname_snapshot": "小红"}],
+    )
+
+    hits = await repo.list_memories_in_range(person_id=10001)
+
+    assert [m.statement for m in hits] == ["小明说的"]
+
+
+async def test_list_messages_for_window_reaches_the_whole_window(repo: Repository) -> None:
+    window = await repo.add_window(
+        group_id=111,
+        started_at=BEGIN,
+        ended_at=BEGIN + timedelta(minutes=5),
+        message_count=2,
+        prompt_version="v2",
+    )
+    await repo.add_message(group_id=111, user_id=1, text="窗口之前", sent_at=BEGIN - timedelta(minutes=1))
+    inside = await repo.add_message(group_id=111, user_id=1, text="窗口之内", sent_at=BEGIN)
+    await repo.add_message(group_id=111, user_id=1, text="窗口之后", sent_at=BEGIN + timedelta(minutes=6))
+
+    messages = await repo.list_messages_for_window(int(window.id))
+
+    assert [m.id for m in messages] == [inside.id]
+    assert await repo.list_messages_for_window(9999) == []
+
+
+async def test_group_switches_expose_enabled_and_disabled_sets(repo: Repository) -> None:
+    await repo.set_group_enabled(111, True)
+    await repo.set_group_enabled(222, False)
+
+    assert await repo.enabled_groups() == [111]
+    assert await repo.disabled_groups() == [222]
+    assert await repo.group_settings() == {111: True, 222: False}
+
+
+async def test_purge_unlinks_references_before_deleting(repo: Repository) -> None:
+    """外键开着（``PRAGMA foreign_keys=ON``），两处引用必须先解开才能删。"""
+    old = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="被推翻的旧条目",
+        confidence=0.9, prompt_version="v2",
+    )
+    new = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="推翻它的新条目",
+        confidence=0.9, prompt_version="v2",
+    )
+    window = await repo.add_window(
+        group_id=111, started_at=BEGIN, ended_at=BEGIN, message_count=1, prompt_version="v2"
+    )
+    replacement = await repo.get_memory(int(new.id))
+    assert replacement is not None
+    await repo.add_window_result(
+        window_id=int(window.id), supersedings=[(int(old.id), replacement)], status=WindowStatus.DONE
+    )
+    await repo.add_feedback(
+        kind=FeedbackKind.FALSE_POSITIVE, memory_id=int(old.id), group_id=111, note="原陈述：…"
+    )
+
+    counts = await repo.purge(memory_ids=[int(old.id)])
+
+    assert counts.memories == 1
+    assert counts.feedback_unlinked == 1
+    assert counts.messages == 0 and counts.windows == 0  # 只删记忆，原文与窗口不动
+    assert await repo.get_memory(int(old.id)) is None
+    assert await repo.get_window(int(window.id)) is not None
+    samples = await repo.list_feedback()
+    assert len(samples) == 1 and samples[0].memory_id is None
+    assert samples[0].note == "原陈述：…"
+
+
+async def test_purge_by_group_removes_windows_before_the_text(repo: Repository) -> None:
+    window = await repo.add_window(
+        group_id=111, started_at=BEGIN, ended_at=BEGIN, message_count=1, prompt_version="v2"
+    )
+    await repo.add_memory(
+        window_id=int(window.id), group_id=111, category=Category.KNOWLEDGE,
+        statement="本群的", confidence=0.9, prompt_version="v2",
+    )
+    await repo.add_message(group_id=111, user_id=1, text="本群的原文", sent_at=BEGIN)
+    await repo.add_message(group_id=222, user_id=1, text="别群的原文", sent_at=BEGIN)
+
+    counts = await repo.purge(group_id=111)
+
+    assert (counts.memories, counts.messages, counts.windows) == (1, 1, 1)
+    assert await repo.list_group_memories(group_id=111) == []
+    assert await repo.get_window(int(window.id)) is None
+    assert [message.group_id for message in await repo.list_messages()] == [222]
+
+
+async def test_purge_everything_clears_the_whole_library(repo: Repository) -> None:
+    await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="任意一条",
+        confidence=0.9, prompt_version="v2",
+    )
+    await repo.add_message(group_id=222, user_id=1, text="任意原文", sent_at=BEGIN)
+
+    counts = await repo.purge(everything=True)
+
+    assert (counts.memories, counts.messages) == (1, 1)
+    assert await repo.list_messages() == []
+    assert await repo.list_memories_in_range(statuses=()) == []
+
+
+async def test_set_memory_status_reports_a_missing_memory(repo: Repository) -> None:
+    memory = await repo.add_memory(
+        group_id=111, category=Category.KNOWLEDGE, statement="存在的一条",
+        confidence=0.9, prompt_version="v2",
+    )
+
+    assert await repo.set_memory_status(int(memory.id), MemoryStatus.EXPIRED) is True
+    assert await repo.set_memory_status(9999, MemoryStatus.EXPIRED) is False
+    reloaded = await repo.get_memory(int(memory.id))
+    assert reloaded is not None and reloaded.status is MemoryStatus.EXPIRED

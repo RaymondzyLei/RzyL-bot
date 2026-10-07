@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from rzyl_core.timeutil import utcnow
@@ -33,6 +35,55 @@ def _require_aware(value: datetime | None, field: str) -> datetime | None:
     if value is not None and value.tzinfo is None:
         raise ValueError(f"{field} 必须带时区")
     return value
+
+
+def _rowcount(result: object) -> int:
+    """取一条 DELETE / UPDATE 的影响行数。
+
+    ``exec_driver_sql`` 与 Core 的 ``delete()`` 返回的都是 ``CursorResult``，但公共签名
+    里只承诺 ``Result``，故用 ``getattr`` 取 ``rowcount``。
+    """
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeCounts:
+    """一次清空实际删掉了多少行，逐表列出——清空是不可逆操作，效果必须看得见。"""
+
+    memories: int = 0
+    messages: int = 0
+    windows: int = 0
+    feedback_unlinked: int = 0
+    """被摘掉 ``memory_id`` 的纠错样本条数（样本本身保留，见 :meth:`Repository.purge`）。"""
+
+
+def _with_statuses(statement: Any, statuses: Sequence[MemoryStatus] | None) -> Any:
+    """按状态过滤 ``memory`` 查询。
+
+    约定（三处语义各有用处，写在类型上而不是靠调用方记）：
+
+    - ``None``（默认）：只取 ``active``——检索与推送的默认语义（故事 22、25）；
+    - 空序列：**不加状态条件**，全部状态都取；
+    - 非空序列：只取列出的状态。
+    """
+    if statuses is None:
+        return statement.where(Memory.status == MemoryStatus.ACTIVE)
+    if not statuses:
+        return statement
+    return statement.where(Memory.status.in_(list(statuses)))
+
+
+def _person_exists(person_id: int):
+    """「``person_refs_json`` 里含这个 QQ 号」的 SQL 条件。
+
+    相关人存的是 JSON 数组（快照，不是外键），所以用 ``json_each`` 展开后比对
+    ``user_id``。SQLite 3.38 起 JSON 函数内置，本项目的库版本远高于此。
+    """
+    return text(
+        "EXISTS (SELECT 1 FROM json_each(memory.person_refs_json) AS person "
+        "WHERE json_extract(person.value, '$.user_id') = :person_id)"
+    ).bindparams(person_id=person_id)
+
 
 
 class Repository:
@@ -309,6 +360,106 @@ class Repository:
             )
             return list(result.scalars().all())
 
+    async def list_messages_for_window(self, window_id: int) -> list[Message]:
+        """取某窗口按起止时间框住的**全部**原文，升序。
+
+        与 ``memory.evidence`` 的区别：``evidence`` 是模型挑出来当依据的那几条，这里是
+        窗口覆盖的整段原文——「记忆 来源」要看的是后者（故事 31：追到原文窗口）。
+        窗口不存在、或没记时间区间（``ended_at`` 为空）时返回空列表。
+        """
+        async with self._sessions() as session:
+            window = await session.get(Window, window_id)
+            if window is None:
+                return []
+            started_at = window.started_at
+            ended_at = window.ended_at
+            group_id = int(window.group_id)
+        if started_at is None or ended_at is None:
+            return []
+        return await self.list_messages_between(
+            group_id=group_id, since=started_at, until=ended_at, limit=500
+        )
+
+    async def list_memories_by_id(self, memory_ids: Sequence[int]) -> list[Memory]:
+        """按编号取条目，**返回顺序与传入顺序一致**；不存在的编号直接跳过。
+
+        RRF 融合出来的名次要看顺序，而 SQL 的 ``IN`` 不保证顺序，所以这里在 Python 侧
+        按传入顺序重排。
+        """
+        cleaned = [int(memory_id) for memory_id in memory_ids]
+        if not cleaned:
+            return []
+        statement = select(Memory).where(Memory.id.in_(cleaned))
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            by_id = {int(memory.id): memory for memory in result.scalars().all()}
+        return [by_id[memory_id] for memory_id in cleaned if memory_id in by_id]
+
+    async def list_memories_in_range(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        group_id: int | None = None,
+        category: Category | None = None,
+        person_id: int | None = None,
+        statuses: Sequence[MemoryStatus] | None = None,
+        limit: int = 200,
+    ) -> list[Memory]:
+        """按时间区间（落在 ``created_at`` 上，左闭右开）与各种前置条件取条目，新的在前。
+
+        与 :meth:`search_memories` 的区别是**没有关键词**：用于「今天」「某个群」这类
+        纯列举场景。``statuses`` 的三档语义见 :func:`_with_statuses`。
+        """
+        statement = select(Memory)
+        statement = _with_statuses(statement, statuses)
+        if since is not None:
+            statement = statement.where(Memory.created_at >= _require_aware(since, "since"))
+        if until is not None:
+            statement = statement.where(Memory.created_at < _require_aware(until, "until"))
+        if group_id is not None:
+            statement = statement.where(Memory.group_id == group_id)
+        if category is not None:
+            statement = statement.where(Memory.category == category)
+        if person_id is not None:
+            statement = statement.where(_person_exists(person_id))
+        statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc()).limit(limit)
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
+    async def set_memory_status(self, memory_id: int, status: MemoryStatus) -> bool:
+        """改一条记忆的状态；条目不存在返回 ``False``。
+
+        只动 ``status`` 一列：``superseded_by`` 之类的引用关系由写入方自己维护，
+        免得「恢复一条被推翻的旧条目」把它的引用链也一并改掉。
+        """
+        async with self._sessions() as session:
+            memory = await session.get(Memory, memory_id)
+            if memory is None:
+                return False
+            memory.status = status
+            await session.commit()
+            return True
+
+    async def clear_superseded_by(self, memory_id: int) -> bool:
+        """清掉**这条记忆自己**的 ``superseded_by``，返回是否真的改动了。
+
+        「记忆 恢复」要用：被 supersede 的旧条目身上带着一个「我是被 #N 推翻的」的引用，
+        它被人工恢复成 ``active`` 之后这条引用就没有意义了——留着会让「``expired`` 且
+        没有 ``superseded_by``」这个判据（人工标为误报）失真。
+
+        注意方向：这里清的是**指向别人的那一列**，不是「指向它的别人」；后者是清空时
+        解外键要做的事，在 :meth:`purge` 里。
+        """
+        async with self._sessions() as session:
+            memory = await session.get(Memory, memory_id)
+            if memory is None or memory.superseded_by is None:
+                return False
+            memory.superseded_by = None
+            await session.commit()
+            return True
+
     # —— 检索 ——
 
     async def search_memories(
@@ -317,12 +468,13 @@ class Repository:
         *,
         category: Category | None = None,
         group_id: int | None = None,
+        person_id: int | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int = 50,
         include_inactive: bool = False,
     ) -> list[Memory]:
-        """FTS5 关键词检索，可按类别 / 群 / 时间范围过滤。
+        """FTS5 关键词检索，可按类别 / 群 / 相关人 / 时间范围过滤。
 
         trigram 分词对中文按子串匹配，但匹配词至少 3 个字；两字及以下的词（如「论文」）
         走 LIKE 兜底。多个空格分隔的词之间是「与」的关系。
@@ -330,6 +482,10 @@ class Repository:
         默认只检索 ``active`` 条目：被 supersede 的旧条目（``expired``）与疑似重复
         （``suspect_duplicate``）默认退出检索（故事 22）；``include_inactive=True``
         才一并取回，供「一键恢复 / 回看历史」这类场景使用。
+
+        时间区间是**左闭右开** ``[since, until)``，与 :meth:`list_memories_in_range` 一致：
+        「今天」的边界正好能表达成「今天 00:00 到明天 00:00」，不必再为午夜那条消息
+        加减一秒。
         """
         terms = [term for term in query.split() if term]
         if not terms:
@@ -355,10 +511,12 @@ class Repository:
             statement = statement.where(Memory.category == category)
         if group_id is not None:
             statement = statement.where(Memory.group_id == group_id)
+        if person_id is not None:
+            statement = statement.where(_person_exists(person_id))
         if since is not None:
-            statement = statement.where(Memory.created_at >= since)
+            statement = statement.where(Memory.created_at >= _require_aware(since, "since"))
         if until is not None:
-            statement = statement.where(Memory.created_at <= until)
+            statement = statement.where(Memory.created_at < _require_aware(until, "until"))
         statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc()).limit(limit)
 
         async with self._sessions() as session:
@@ -384,18 +542,34 @@ class Repository:
     async def list_embeddings(
         self,
         *,
+        category: Category | None = None,
         group_id: int | None = None,
+        person_id: int | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
         include_inactive: bool = False,
     ) -> list[tuple[int, list[float]]]:
-        """取出全部已算好的向量，供暴力余弦使用。"""
+        """取出已算好向量的条目的 ``(编号, 向量)``，供暴力余弦使用。
+
+        前置过滤项与 :meth:`search_memories` 一一对应：混合检索的两路必须**看到同一批
+        候选**，否则 RRF 会把「被过滤掉、却在另一路里排第一」的条目捞回来。
+        """
         statement = select(Memory.id, Memory.embedding).where(func.length(Memory.embedding) > 0)
         if not include_inactive:
             statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
+        if category is not None:
+            statement = statement.where(Memory.category == category)
         if group_id is not None:
             statement = statement.where(Memory.group_id == group_id)
+        if person_id is not None:
+            statement = statement.where(_person_exists(person_id))
+        if since is not None:
+            statement = statement.where(Memory.created_at >= _require_aware(since, "since"))
+        if until is not None:
+            statement = statement.where(Memory.created_at < _require_aware(until, "until"))
         async with self._sessions() as session:
             rows = (await session.execute(statement)).all()
-            return [(row.id, decode_vector(row.embedding)) for row in rows]
+            return [(int(row.id), decode_vector(row.embedding)) for row in rows]
 
     # —— 记账与纠错 ——
 
@@ -484,6 +658,15 @@ class Repository:
             await session.commit()
         return feedback
 
+    async def list_feedback(self, *, limit: int = 50) -> list[Feedback]:
+        """取最近的纠错样本，新的在前（里程碑 4 的错例集回归跑它）。"""
+        statement = (
+            select(Feedback).order_by(Feedback.created_at.desc(), Feedback.id.desc()).limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
     # —— 每群开关 ——
 
     async def set_group_enabled(self, group_id: int, enabled: bool) -> None:
@@ -510,6 +693,124 @@ class Repository:
                 .order_by(GroupSetting.group_id)
             )
             return list(result.scalars().all())
+
+    async def disabled_groups(self) -> list[int]:
+        """被**显式关掉**的群号。
+
+        与 :meth:`enabled_groups` 一起构成「数据库里的每群开关」，两者都不含没有行的群。
+        有行就是显式表态，于是运行时的「暂停」才能真正压过配置里的白名单——否则
+        ``记忆 暂停`` 对一个写在 ``RZYL_GROUP_WHITELIST`` 里的群是个空操作。
+        """
+        async with self._sessions() as session:
+            result = await session.execute(
+                select(GroupSetting.group_id)
+                .where(GroupSetting.enabled == False)  # noqa: E712 —— 同上
+                .order_by(GroupSetting.group_id)
+            )
+            return list(result.scalars().all())
+
+    async def group_settings(self) -> dict[int, bool]:
+        """每群开关的完整快照：``{群号: 是否开启}``，只含**有行**的群。"""
+        async with self._sessions() as session:
+            result = await session.execute(select(GroupSetting.group_id, GroupSetting.enabled))
+            return {int(row.group_id): bool(row.enabled) for row in result.all()}
+
+    # —— 清空（里程碑 3 的「记忆 清空」）——
+
+    async def purge(
+        self,
+        *,
+        memory_ids: Sequence[int] | None = None,
+        group_id: int | None = None,
+        everything: bool = False,
+    ) -> PurgeCounts:
+        """按范围彻底删除记忆、原文与窗口，返回逐表删除行数。
+
+        三个范围**互斥且必须显式给一个**（这是不可逆操作，不给默认值）：
+
+        - ``memory_ids``：只删这几条记忆，「原文与窗口不动」。单条记忆引用的原文常常
+          与同群其它条目共用，删原文会连累别人。
+        - ``group_id``：删这个群的记忆、原文与窗口——「这个群我不看了」，痕迹一起清掉。
+        - ``everything``：全库清空。
+
+        两处**引用**必须先解开，否则 ``PRAGMA foreign_keys=ON`` 会直接拒绝删除：
+
+        1. ``memory.superseded_by`` 指向即将被删的条目时置空；
+        2. ``feedback.memory_id`` 指向即将被删的条目时置空——**样本本身保留**。误报样本
+           是调提示词的回归材料（故事 39），不能因为「删掉了那条记忆」就跟着消失；所以
+           记误报时会把原陈述**快照**进 ``note``（与 ``person_refs`` 存快照同理）。
+
+        删除顺序：记忆 → 窗口 → 原文。``memory.window_id`` 是外键，所以窗口必须等记忆
+        删完；原文没有任何外键指向它，放最后只是为了读起来顺。
+        """
+        provided = [
+            memory_ids is not None and len(memory_ids) > 0,
+            group_id is not None,
+            everything,
+        ]
+        if sum(1 for item in provided if item) != 1:
+            raise ValueError(
+                "purge 必须且只能指定一个范围：memory_ids / group_id / everything"
+            )
+
+        async with self._sessions() as session:
+            targets = select(Memory.id)
+            if memory_ids is not None:
+                targets = targets.where(Memory.id.in_([int(value) for value in memory_ids]))
+            elif group_id is not None:
+                targets = targets.where(Memory.group_id == group_id)
+            target_ids = [int(value) for value in (await session.execute(targets)).scalars().all()]
+
+            unlinked = 0
+            if target_ids:
+                # 先解开两处引用：外键开着，直接删会被拒绝。
+                unlinked = _rowcount(
+                    await session.execute(
+                        update(Feedback)
+                        .where(Feedback.memory_id.in_(target_ids))
+                        .values(memory_id=None)
+                    )
+                )
+                await session.execute(
+                    update(Memory)
+                    .where(Memory.superseded_by.in_(target_ids))
+                    .values(superseded_by=None)
+                )
+
+            memory_statement = delete(Memory)
+            if memory_ids is not None:
+                # 按编号点名：点名里不存在的编号自然什么都不删（空列表也不必发语句）。
+                memories_deleted = (
+                    _rowcount(
+                        await session.execute(memory_statement.where(Memory.id.in_(target_ids)))
+                    )
+                    if target_ids
+                    else 0
+                )
+            else:
+                if group_id is not None:
+                    memory_statement = memory_statement.where(Memory.group_id == group_id)
+                memories_deleted = _rowcount(await session.execute(memory_statement))
+
+            messages_deleted = 0
+            windows_deleted = 0
+            if everything or group_id is not None:
+                window_statement = delete(Window)
+                message_statement = delete(Message)
+                if group_id is not None:
+                    window_statement = window_statement.where(Window.group_id == group_id)
+                    message_statement = message_statement.where(Message.group_id == group_id)
+                windows_deleted = _rowcount(await session.execute(window_statement))
+                messages_deleted = _rowcount(await session.execute(message_statement))
+
+            await session.commit()
+
+        return PurgeCounts(
+            memories=memories_deleted,
+            messages=messages_deleted,
+            windows=windows_deleted,
+            feedback_unlinked=unlinked,
+        )
 
     # —— 原文消息的读与清理（以下为工单 #5 追加）——
 
@@ -628,8 +929,7 @@ class Repository:
         async with self._sessions() as session:
             result = await session.execute(delete(Message).where(Message.sent_at < cutoff))
             await session.commit()
-            # DELETE 返回的是 CursorResult，但公共签名里只有 Result，故用 getattr 取 rowcount。
-            return int(getattr(result, "rowcount", 0) or 0)
+            return _rowcount(result)
 
     # —— 向量补算（以下为工单 #5 追加）——
 

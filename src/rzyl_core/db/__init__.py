@@ -10,7 +10,7 @@ from .column_types import TZDateTime
 from .engine import open_engine
 from .enums import Category, FeedbackKind, MemoryStatus, WindowStatus
 from .models import Base, Feedback, GroupSetting, LlmCall, Memory, Message, PersonRef, Window
-from .repository import Repository
+from .repository import PurgeCounts, Repository
 from .schema import SCHEMA_VERSION, apply_schema
 from .vectors import decode_vector, encode_vector
 
@@ -26,6 +26,7 @@ __all__ = [
     "MemoryStatus",
     "Message",
     "PersonRef",
+    "PurgeCounts",
     "Repository",
     "TZDateTime",
     "Window",
