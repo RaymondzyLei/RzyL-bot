@@ -23,27 +23,26 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
   向量全部刷新（后台补算循环只用默认的 ``reembed=False``，不会自动重算全部向量）。
   启动与补算入口还会各跑一次「向量模型账本一致性」检查（同维度换模型也能查出，
   见 :meth:`Runtime.check_embedding_model_ledger`），同一进程只提醒一次。
-- **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠
-  ``_window_flush_loop`` 周期把未满的缓冲按时成窗并入库；间隔取
-  ``settings.window_flush_seconds``。
-- **死信重试**（``retry_dead_windows``）：**已实现**。``_dead_letter_loop`` 周期找出
-  状态为 ``dead`` 的窗口重跑；护栏与可观察性见 :meth:`Runtime.retry_dead_windows` 的
-  文档字符串。间隔取 ``settings.dead_letter_retry_seconds``。
+- **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠后台循环周期把
+  未满的缓冲按时成窗并入库；间隔取 ``settings.window_flush_seconds``。
+- **死信重试**（``retry_dead_windows``）：**已实现**。后台循环周期找出状态为 ``dead``
+  的窗口重跑；护栏与可观察性见 :meth:`Runtime.retry_dead_windows` 的文档字符串。
+  间隔取 ``settings.dead_letter_retry_seconds``。
 - **启动对账**（``reconcile_uncovered_messages``）：**已实现**。``start()`` 打开
   ``settings.reconcile_on_startup``（默认开）时，用一个一次性后台任务把「没有被任何窗口
   时间区间覆盖」的消息重新送进窗口管道——补上「重启丢掉内存缓冲、而回补锚点又不会拉
   已存消息」这个洞。任务不阻塞启动，登记进 ``self._tasks`` 供 ``stop()`` 取消。
-- **每日推送**（``push_daily_report_if_due``）：**已实现**。``start()`` 拉起
-  ``_daily_push_loop``，按 ``settings.push_hour/push_minute``（``settings.timezone`` 计）
-  到点触发：**先强制关窗**、再按类别渲染当天条目，交给已登记的投递器（``memory.push``）。
-  core 不认识 QQ，所以发送这件事由插件登记进来；没登记就只记一条告警，绝不假装发出去了。
-- 保留期清理与向量补算两个老循环的间隔仍是模块常量（``RETENTION_SWEEP_SECONDS`` /
-  ``EMBEDDING_SWEEP_SECONDS``）；新增的三个循环按里程碑 2 的要求从设置读。
+- **每日推送**（``push_daily_report_if_due``）：**已实现**。``start()`` 起一个循环，按
+  ``settings.push_hour/push_minute``（``settings.timezone`` 计）到点触发：**先强制关窗**、
+  再按类别渲染当天条目，交给已登记的投递器（``memory.push``）。core 不认识 QQ，所以发送
+  这件事由插件登记进来；没登记就只记一条告警，绝不假装发出去了。
 
-里程碑 3 还给了 Runtime 三样出口，供插件与脚本消费记忆：``execute_command``（一条命令
-进、一段私聊文本出）、``build_daily_report``（关窗 + 渲染，不负责发送）、
-``search_memories``（混合检索）。三者都只是把 :mod:`rzyl_core.memory` 里的实现接上来，
-Runtime 依旧是**唯一对外入口**。
+这五个循环共用 :meth:`Runtime._run_periodically` 一个骨架（间隔从设置或模块常量取），
+所以「单轮失败只记日志、不悄悄停掉循环」这条约定只写一遍。
+
+里程碑 3 还给了 Runtime 两个消费记忆的出口，供插件与脚本用：``execute_command``（一条
+命令进、一段私聊文本出）与 ``build_daily_report``（关窗 + 渲染，不负责发送）。两者都只是
+把 :mod:`rzyl_core.memory` 里的实现接上来，Runtime 依旧是**唯一对外入口**。
 
 回放有两个模式，差别只在**写与不写**：
 
@@ -75,7 +74,6 @@ from rzyl_core.memory.commands import CommandResult, MemoryCommand
 from rzyl_core.memory.console import MemoryConsole
 from rzyl_core.memory.push import get_report_sender, next_push_at, schedule_push_at
 from rzyl_core.memory.report import DailyReport, render_daily_report
-from rzyl_core.memory.retrieval import DEFAULT_SEARCH_LIMIT, RetrievalOutcome, hybrid_search
 from rzyl_core.pipeline.collector import collect, merge_allowed_groups
 from rzyl_core.pipeline.extract import ExtractionOutcome, ExtractionPipeline, PreviewOutcome
 from rzyl_core.pipeline.history import HistorySource, HistoryMessage, message_dedupe_hash
@@ -319,11 +317,40 @@ class Runtime:
         await self.check_embedding_model_ledger()
         if run_background_tasks:
             self._tasks = [
-                asyncio.create_task(self._retention_loop(), name="rzyl-retention-sweep"),
-                asyncio.create_task(self._embedding_loop(), name="rzyl-embedding-backfill"),
-                asyncio.create_task(self._window_flush_loop(), name="rzyl-window-flush"),
-                asyncio.create_task(self._dead_letter_loop(), name="rzyl-dead-letter-retry"),
-                asyncio.create_task(self._daily_push_loop(), name="rzyl-daily-push"),
+                asyncio.create_task(
+                    self._run_periodically(
+                        RETENTION_SWEEP_SECONDS, self.cleanup_retention, "保留期清理"
+                    ),
+                    name="rzyl-retention-sweep",
+                ),
+                asyncio.create_task(
+                    self._run_periodically(
+                        EMBEDDING_SWEEP_SECONDS, self.backfill_embeddings, "向量补算"
+                    ),
+                    name="rzyl-embedding-backfill",
+                ),
+                asyncio.create_task(
+                    self._run_periodically(
+                        self._settings.window_flush_seconds,
+                        self._window_flush_tick,
+                        "窗口超时刷新",
+                    ),
+                    name="rzyl-window-flush",
+                ),
+                asyncio.create_task(
+                    self._run_periodically(
+                        self._settings.dead_letter_retry_seconds,
+                        self.retry_dead_windows,
+                        "死信重试",
+                    ),
+                    name="rzyl-dead-letter-retry",
+                ),
+                asyncio.create_task(
+                    self._run_periodically(
+                        PUSH_TICK_SECONDS, self.push_daily_report_if_due, "每日推送"
+                    ),
+                    name="rzyl-daily-push",
+                ),
             ]
             if self._settings.reconcile_on_startup:
                 # 一次性任务：启动时不阻塞（对账可能调几十次模型），跑完自己结束；
@@ -508,19 +535,6 @@ class Runtime:
             raise RuntimeError("Runtime 尚未 start()，记忆命令不可用")
         return await self._console.execute(command)
 
-    async def search_memories(
-        self, query: str, *, limit: int = DEFAULT_SEARCH_LIMIT
-    ) -> RetrievalOutcome:
-        """混合检索（关键词 + 语义，RRF 融合）。离线脚本与验收用它。"""
-        repository = self._require_repository()
-        return await hybrid_search(
-            repository=repository,
-            embedding=self._embedding,
-            query=query,
-            min_similarity=self._settings.retrieval_min_similarity,
-            limit=limit,
-        )
-
     async def build_daily_report(self, now: datetime | None = None) -> DailyReport:
         """关掉全部未满窗口，再把「当天」的活跃条目渲染成一份日报（**不负责发送**）。
 
@@ -557,15 +571,19 @@ class Runtime:
         """到点就生成并投递日报；没到点返回 ``None``。
 
         「到点」由 :func:`~rzyl_core.memory.push.next_push_at` 算，只看 ``settings.timezone``
-        的墙上时间。第一次调用时排定下一次；**先排下一班再干活**——生成日报会调模型、
-        可能花掉几十秒，排班不能被它拖后。
+        的墙上时间。第一次调用时排定下一次（见
+        :func:`~rzyl_core.memory.push.schedule_push_at` 的启动宽限）。
 
-        投递失败会**在当天重试**（``PUSH_RETRY_SECONDS`` 一次、至多 ``PUSH_MAX_ATTEMPTS``
-        次）而不是等到明天：最常见的失败原因是这一刻 QQ 没连上（NapCat 掉线、正在重启），
-        十分钟后可能就好了。重试到顶就放弃并记一条告警——不会整夜每十分钟刷一条异常。
+        **失败一天都不丢**，这是本方法最要紧的性质，两处都按这个来设计：
 
-        三种结果都留痕：没登记投递器（告警，并说清「生成了但没发出去」）、投递失败
-        （异常日志 + 重试）、投递成功（INFO）。
+        - 生成日报会真的调模型（先强制关窗），所以它也可能失败；失败时**不**把排班推到
+          明天，而是在当天稍后重试（``PUSH_RETRY_SECONDS`` 一次，至多 ``PUSH_MAX_ATTEMPTS``
+          次）。排班只在「这次不用再试了」——投递成功、没有投递器、或重试用尽——才推进。
+        - 最常见的失败原因是这一刻 QQ 没连上（NapCat 掉线或正在重启），十分钟后可能就好了，
+          所以重试落在**当天**而不是等到明天。
+
+        三种结果都留痕：没登记投递器（告警，说清「生成了但没发出去」）、失败（异常日志 +
+        重试或放弃，放弃时提示可以手工用 ``记忆 今天`` 看）、成功（INFO）。
         """
         if not self._settings.push_enabled:
             return None
@@ -585,54 +603,99 @@ class Runtime:
             )
         if moment < self._next_push_at:
             return None
-        self._next_push_at = next_push_at(
+
+        # 「下一次正常时刻」先算好但**先不落**：生成日报要关窗（真实调模型），它失败的话
+        # 排到明天就等于把一整天丢了。所以排班只在「这次不用再试」时才推进到它。
+        next_normal = next_push_at(
             moment,
             hour=self._settings.push_hour,
             minute=self._settings.push_minute,
             tz=self._timezone,
         )
-        report = await self.build_daily_report(moment)
+        try:
+            report = await self.build_daily_report(moment)
+        except Exception:
+            logger.exception("日报生成失败（关窗或渲染出错）")
+            self._schedule_after_failure(moment, next_normal)
+            return None
+
         sender = get_report_sender()
         if sender is None:
             logger.warning(
                 "日报已生成但没登记投递器（插件没加载？），本次没有发出去：共 %d 条",
                 report.total,
             )
+            self._finish_attempt(next_normal)
             return report
         try:
             await sender(report)
         except Exception:
-            self._push_attempts += 1
-            if self._push_attempts < PUSH_MAX_ATTEMPTS:
-                self._next_push_at = moment + timedelta(seconds=PUSH_RETRY_SECONDS)
-                logger.exception(
-                    "日报投递失败（共 %d 条，第 %d/%d 次）：%d 秒后重试",
-                    report.total,
-                    self._push_attempts,
-                    PUSH_MAX_ATTEMPTS,
-                    PUSH_RETRY_SECONDS,
-                )
-            else:
-                logger.exception(
-                    "日报投递连续失败 %d 次（共 %d 条），本次放弃，明天再推",
-                    self._push_attempts,
-                    report.total,
-                )
+            logger.exception(
+                "日报投递失败（共 %d 条，第 %d/%d 次）", report.total, self._push_attempts + 1,
+                PUSH_MAX_ATTEMPTS,
+            )
+            self._schedule_after_failure(moment, next_normal)
             return report
-        self._push_attempts = 0
         logger.info("日报已投递：%s，列出 %d 条", report.day.isoformat(), report.listed)
+        self._finish_attempt(next_normal)
         return report
 
-    async def _daily_push_loop(self) -> None:
-        """每 ``PUSH_TICK_SECONDS`` 醒一次问到点没有；单轮失败不退循环。"""
+    def _schedule_after_failure(self, moment: datetime, next_normal: datetime) -> None:
+        """一次失败之后：没到上限就在当天稍后重试，到顶就放弃到明天。
+
+        计数在**放弃时清零**，否则第二天第一次投递失败会直接撞上昨天的旧计数、一次都不重试。
+        """
+        self._push_attempts += 1
+        if self._push_attempts < PUSH_MAX_ATTEMPTS:
+            self._next_push_at = moment + timedelta(seconds=PUSH_RETRY_SECONDS)
+            logger.warning(
+                "第 %d/%d 次尝试失败：%d 秒后重试（不是明天）",
+                self._push_attempts,
+                PUSH_MAX_ATTEMPTS,
+                PUSH_RETRY_SECONDS,
+            )
+            return
+        logger.error(
+            "日报连续失败 %d 次，本次放弃，明天再推；已生成的条目不会丢，"
+            "可以私聊发「记忆 今天」手工看",
+            self._push_attempts,
+        )
+        self._finish_attempt(next_normal)
+
+    def _finish_attempt(self, next_normal: datetime) -> None:
+        """这次投递有了结论（成功、无处投递、或放弃重试）：排到下一个正常时刻，计数清零。"""
+        self._push_attempts = 0
+        self._next_push_at = next_normal
+
+    # —— 后台循环的公共骨架 ——
+
+    async def _run_periodically(
+        self,
+        interval_seconds: float,
+        action: Callable[[], Awaitable[Any]],
+        label: str,
+    ) -> None:
+        """每隔 ``interval_seconds`` 跑一次 ``action``，**单轮失败绝不退出循环**。
+
+        五个后台循环（保留期清理、向量补算、窗口刷新、死信重试、每日推送）本来各写了一遍
+        逐字相同的 ``while True: sleep / try / except CancelledError / except Exception``：
+        抽成一处，是为了让「失败只记日志、不悄悄停掉这个循环」这条唯一的约定只写一遍——
+        后台任务静默退出是那种要等一个月才发现少东西的失败。
+        """
         while True:
-            await asyncio.sleep(PUSH_TICK_SECONDS)
+            await asyncio.sleep(interval_seconds)
             try:
-                await self.push_daily_report_if_due()
+                await action()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("每日推送失败，下一轮再试")
+                logger.exception("%s失败，下一轮再试", label)
+
+    async def _window_flush_tick(self) -> None:
+        """窗口超时刷新的一轮：关掉到点的缓冲，并在真关了东西时留一行日志。"""
+        outcomes = await self.flush_expired()
+        if outcomes:
+            logger.info("窗口超时刷新关闭了 %d 个窗口", len(outcomes))
 
     # —— 后台任务：保留期清理 ——
 
@@ -644,17 +707,6 @@ class Runtime:
         if removed:
             logger.info("保留期清理删除了 %d 条原文（截止 %s）", removed, cutoff.isoformat())
         return removed
-
-    async def _retention_loop(self) -> None:
-        """按固定间隔跑保留期清理；单轮失败不影响下一轮。"""
-        while True:
-            await asyncio.sleep(RETENTION_SWEEP_SECONDS)
-            try:
-                await self.cleanup_retention()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # 后台任务绝不能因为一次失败就静默退出
-                logger.exception("保留期清理失败，下一轮再试")
 
     # —— 后台任务：向量补算 ——
 
@@ -766,37 +818,7 @@ class Runtime:
             error=error,
         )
 
-    async def _embedding_loop(self) -> None:
-        """按固定间隔跑向量补算；单轮失败不影响下一轮。"""
-        while True:
-            await asyncio.sleep(EMBEDDING_SWEEP_SECONDS)
-            try:
-                await self.backfill_embeddings()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("向量补算失败，下一轮再试")
-
-    # —— 后台任务：窗口超时刷新（里程碑 2）——
-
-    async def _window_flush_loop(self) -> None:
-        """按 ``settings.window_flush_seconds`` 周期调 ``flush_expired()``；单轮失败不退循环。
-
-        群里没人说话时，未满的缓冲靠这个循环按时成窗——否则消息会一直卡在内存里，
-        直到下一条消息到来或进程重启（重启就丢，只能靠回补兜底）。
-        """
-        while True:
-            await asyncio.sleep(self._settings.window_flush_seconds)
-            try:
-                outcomes = await self.flush_expired()
-                if outcomes:
-                    logger.info("窗口超时刷新关闭了 %d 个窗口", len(outcomes))
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("窗口超时刷新失败，下一轮再试")
-
-    # —— 后台任务：死信重试（里程碑 2）——
+    # —— 死信重试 ——
 
     async def retry_dead_windows(self, *, limit: int = DEAD_LETTER_RETRY_BATCH) -> int:
         """重试状态为 ``dead`` 的窗口，返回本轮真正重试（或判定放弃）的窗口数。
@@ -878,17 +900,6 @@ class Runtime:
             messages=messages,
             prompt_version=window.prompt_version,
         )
-
-    async def _dead_letter_loop(self) -> None:
-        """按 ``settings.dead_letter_retry_seconds`` 周期跑死信重试；单轮失败不退循环。"""
-        while True:
-            await asyncio.sleep(self._settings.dead_letter_retry_seconds)
-            try:
-                await self.retry_dead_windows()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("死信重试失败，下一轮再试")
 
     # —— 启动对账（里程碑 2）——
 

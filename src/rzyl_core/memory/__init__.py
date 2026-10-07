@@ -33,7 +33,6 @@ from rzyl_core.memory.push import (
     set_report_sender,
 )
 from rzyl_core.memory.report import (
-    CATEGORY_LABELS,
     CATEGORY_SECTIONS,
     DailyReport,
     format_memory_line,
@@ -50,7 +49,6 @@ from rzyl_core.memory.retrieval import (
 )
 
 __all__ = [
-    "CATEGORY_LABELS",
     "CATEGORY_SECTIONS",
     "COMMAND_PREFIX",
     "DEFAULT_SEARCH_LIMIT",

@@ -26,8 +26,6 @@ CATEGORY_SECTIONS: tuple[tuple[Category, str], ...] = (
     (Category.KNOWLEDGE, "知识"),
 )
 
-CATEGORY_LABELS: dict[Category, str] = {category: label for category, label in CATEGORY_SECTIONS}
-
 #: 条目状态在文本里的标记；``active`` 不带标记。
 STATUS_MARKS: dict[MemoryStatus, str] = {
     MemoryStatus.SUSPECT_DUPLICATE: "[疑似重复] ",
@@ -171,7 +169,6 @@ def render_listing(
 
 
 __all__ = [
-    "CATEGORY_LABELS",
     "CATEGORY_SECTIONS",
     "STATUS_MARKS",
     "DailyReport",

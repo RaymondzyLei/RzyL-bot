@@ -141,40 +141,53 @@ class MemoryConsole:
         flushed = await self._flush()
         now = self._clock()
         since, until = local_day_bounds(now, self._timezone)
+        day = now.astimezone(self._timezone).strftime("%m-%d")
+        return await self._listing(
+            header=f"今天（{day}）新增的条目",
+            empty_text="今天还没有条目。",
+            footer=f"（查询前补关了 {flushed} 个窗口）" if flushed else None,
+            since=since,
+            until=until,
+        )
+
+    async def _group(self, command: MemoryCommand) -> CommandResult:
+        assert command.group_id is not None  # 解析层保证；assert 只为让类型收窄
+        return await self._listing(
+            header=f"群 {command.group_id} 的条目",
+            empty_text="这个群还没有条目（或不在采集范围内）。",
+            footer=await self._group_state_note(command.group_id),
+            group_id=command.group_id,
+        )
+
+    async def _listing(
+        self,
+        *,
+        header: str,
+        empty_text: str,
+        group_id: int | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        footer: str | None = None,
+    ) -> CommandResult:
+        """「今天」与「某个群」共用的列举：取条目 → 渲染 → 说明是否撞到读取上限。
+
+        两个命令的差别只有筛选条件与措辞，取法完全相同，所以合成一处——尤其那句「已达单次
+        读取上限」不能让两边各写一遍、慢慢写成两种说法。
+        """
         rows = await self._repository.list_memories_in_range(
+            group_id=group_id,
             since=since,
             until=until,
             statuses=LISTING_STATUSES,
             limit=LISTING_FETCH_LIMIT,
         )
-        day = now.astimezone(self._timezone).strftime("%m-%d")
-        footer = f"（查询前补关了 {flushed} 个窗口）" if flushed else None
         text = render_listing(
             rows,
-            header=f"今天（{day}）新增的条目",
+            header=header,
             tz=self._timezone,
             max_entries=LISTING_MAX_ENTRIES,
-            empty_text="今天还没有条目。",
+            empty_text=empty_text,
             footer=footer,
-        )
-        if len(rows) >= LISTING_FETCH_LIMIT:
-            text += f"\n\n（已达单次读取上限 {LISTING_FETCH_LIMIT} 条，可能还有更早的没取到）"
-        return CommandResult(text=text)
-
-    async def _group(self, command: MemoryCommand) -> CommandResult:
-        assert command.group_id is not None  # 解析层保证；assert 只为让类型收窄
-        rows = await self._repository.list_memories_in_range(
-            group_id=command.group_id,
-            statuses=LISTING_STATUSES,
-            limit=LISTING_FETCH_LIMIT,
-        )
-        text = render_listing(
-            rows,
-            header=f"群 {command.group_id} 的条目",
-            tz=self._timezone,
-            max_entries=LISTING_MAX_ENTRIES,
-            empty_text="这个群还没有条目（或不在采集范围内）。",
-            footer=await self._group_state_note(command.group_id),
         )
         if len(rows) >= LISTING_FETCH_LIMIT:
             text += f"\n\n（已达单次读取上限 {LISTING_FETCH_LIMIT} 条，可能还有更早的没取到）"

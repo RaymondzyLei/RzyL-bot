@@ -263,20 +263,35 @@ def format_help(
     return "\n".join(lines)
 
 
+def _semantic_note(outcome: RetrievalOutcome) -> str | None:
+    """语义那一路没参与时的一句说明；参与了就返回 ``None``。
+
+    必须说清**为什么**（``semantic_error``，例如「向量服务未配置」）：只跑了关键词这件事
+    不是一个看不见的细节——语义检索的漏检在这里是看不出来的，用户得知道自己拿到的
+    结果是哪一种。
+    """
+    if outcome.semantic_available:
+        return None
+    reason = outcome.semantic_error or "原因未知"
+    return f"（本次只用了关键词检索：语义那一路没跑，{reason}）"
+
+
 def format_search(outcome: RetrievalOutcome, *, query: str, tz: tzinfo) -> str:
     """渲染一次混合检索的结果，并如实说明语义那一路有没有参与。"""
     header = f"检索「{query}」：命中 {outcome.total} 条"
     detail = f"关键词 {outcome.keyword_hits} 条 · 语义 {outcome.vector_hits} 条"
+    note = _semantic_note(outcome)
     if not outcome.hits:
-        text = f"{header}（{detail}）\n\n没有找到条目。\n（如果这不是你想搜的，发「记忆」看用法）"
-        if not outcome.semantic_available:
-            text += "\n（本次只用了关键词检索：向量服务不可用）"
-        return text
-    lines = "\n".join(format_memory_line(hit.memory, tz=tz, with_date=True) for hit in outcome.hits)
-    body = [header, detail, "", lines]
-    if not outcome.semantic_available:
-        body.append("\n（本次只用了关键词检索：向量服务不可用，语义检索的漏检在这里看不出来）")
-    return "\n".join(body)
+        lines = [header, detail, "", "没有找到条目。", "（如果这不是你想搜的，发「记忆」看用法）"]
+        if note:
+            lines.append(note)
+        return "\n".join(lines)
+    lines = [header, detail, "", "\n".join(
+        format_memory_line(hit.memory, tz=tz, with_date=True) for hit in outcome.hits
+    )]
+    if note:
+        lines.append(note)
+    return "\n".join(lines)
 
 
 def _truncate(text: str, limit: int) -> str:

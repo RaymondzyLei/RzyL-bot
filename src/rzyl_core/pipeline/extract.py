@@ -305,8 +305,6 @@ class PreviewOutcome:
     model: str | None = None
 
 
-
-
 class ExtractionPipeline:
     """提取入库管道：组装好的窗口进来，记忆条目、窗口状态与记账出去。
 

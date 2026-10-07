@@ -193,7 +193,10 @@ async def test_flush_pending_can_target_one_group(tmp_path: Path, clock: _Clock)
         await runtime.ingest(group_id=222, user_id=USER, text="别的群", sent_at=BEGIN)
 
         assert await runtime.flush_pending(222) == 1
-        assert runtime._require_assembler().buffered_count(GROUP) == 1  # pyright: ignore[reportPrivateUsage]
+
+        # 只有 222 成了窗（因而有条目）；GROUP 那条还在缓冲里，所以库中一条都没有。
+        assert len(await runtime.repository.list_group_memories(group_id=222)) == 2
+        assert await runtime.repository.list_group_memories(group_id=GROUP) == []
     finally:
         await runtime.stop()
 
@@ -460,5 +463,73 @@ async def test_push_reopens_a_fresh_schedule_on_the_next_day(
         await runtime.push_daily_report_if_due()
 
         assert [report.day.isoformat() for report in delivered] == ["2026-10-07", "2026-10-08"]
+    finally:
+        await runtime.stop()
+
+
+async def test_a_generation_failure_does_not_lose_the_day(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """生成日报要先强制关窗、会真调模型，所以它也会失败。
+
+    排班要是这时已经推到明天，一整天就静默没了——所以生成失败必须在**当天**重试。
+    这里把失败注入到 ``build_daily_report`` 上（它是 Runtime 自己的协作方，替换它来造故障，
+    不是给被测对象内部打桩）。
+    """
+    deliver, delivered = _recorder()
+    set_report_sender(deliver)
+    runtime = _runtime(tmp_path, clock)
+    calls: list[datetime] = []
+
+    async def exploding(now: datetime | None = None):  # pyright: ignore[reportUnknownParameterType]
+        calls.append(now or clock.now)
+        raise RuntimeError("关窗时挂掉了")
+
+    await runtime.start(run_background_tasks=False)
+    try:
+        monkeypatch.setattr(runtime, "build_daily_report", exploding)
+        clock.set(datetime(2026, 10, 7, 21, 30, tzinfo=CST))
+        assert await runtime.push_daily_report_if_due() is None
+
+        clock.set(datetime(2026, 10, 7, 22, 0, tzinfo=CST))
+        assert await runtime.push_daily_report_if_due() is None
+
+        clock.set(datetime(2026, 10, 7, 22, 10, tzinfo=CST))
+        assert await runtime.push_daily_report_if_due() is None
+
+        assert len(calls) == 2  # 到了当天稍后确实又试了一次
+        assert delivered == []
+    finally:
+        await runtime.stop()
+
+
+async def test_the_attempt_counter_resets_so_the_next_day_retries_again(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """昨天的重试计数不能带到今天：否则今天第一次失败就直接放弃，一次都不重试。"""
+    attempts: list[DailyReport] = []
+
+    async def always_fails(report: DailyReport) -> None:
+        attempts.append(report)
+        raise RuntimeError("NapCat 一直没连上")
+
+    set_report_sender(always_fails)
+    runtime = _runtime(tmp_path, clock)
+    await runtime.start(run_background_tasks=False)
+    try:
+        clock.set(datetime(2026, 10, 7, 21, 30, tzinfo=CST))
+        await runtime.push_daily_report_if_due()
+        for minute in (0, 10, 20, 30):
+            clock.set(datetime(2026, 10, 7, 22, minute, tzinfo=CST))
+            await runtime.push_daily_report_if_due()
+        assert len(attempts) == 3  # 第一天用尽三次
+
+        clock.set(datetime(2026, 10, 8, 21, 30, tzinfo=CST))
+        await runtime.push_daily_report_if_due()
+        for minute in (0, 10):
+            clock.set(datetime(2026, 10, 8, 22, minute, tzinfo=CST))
+            await runtime.push_daily_report_if_due()
+
+        assert len(attempts) == 5  # 第二天又从第一次开始重试
     finally:
         await runtime.stop()

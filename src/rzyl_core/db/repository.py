@@ -73,6 +73,16 @@ def _with_statuses(statement: Any, statuses: Sequence[MemoryStatus] | None) -> A
     return statement.where(Memory.status.in_(list(statuses)))
 
 
+def _statuses_of(include_inactive: bool) -> Sequence[MemoryStatus] | None:
+    """把旧的 ``include_inactive`` 开关翻译成 :func:`_with_statuses` 的三档语义。
+
+    两套写法并存是历史：里程碑 1 只需要「要不要带上不活跃的」，里程碑 3 需要「正好这几种
+    状态」。状态判定只在一处实现（见 :func:`_with_statuses` 的约定），这里只做翻译，免得
+    同一个「什么算活跃」在很多个方法里各写一遍、日后慢慢漂移。
+    """
+    return () if include_inactive else None
+
+
 def _person_exists(person_id: int):
     """「``person_refs_json`` 里含这个 QQ 号」的 SQL 条件。
 
@@ -83,7 +93,6 @@ def _person_exists(person_id: int):
         "EXISTS (SELECT 1 FROM json_each(memory.person_refs_json) AS person "
         "WHERE json_extract(person.value, '$.user_id') = :person_id)"
     ).bindparams(person_id=person_id)
-
 
 
 class Repository:
@@ -338,9 +347,9 @@ class Repository:
         默认只给 ``active`` 的条目：被 supersede 的旧条目（``expired``）与疑似重复
         （``suspect_duplicate``）默认退出检索与推送（故事 22），显式开关可一并取回。
         """
-        statement = select(Memory).where(Memory.group_id == group_id)
-        if not include_inactive:
-            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
+        statement = _with_statuses(
+            select(Memory).where(Memory.group_id == group_id), _statuses_of(include_inactive)
+        )
         statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc())
         async with self._sessions() as session:
             result = await session.execute(statement)
@@ -494,9 +503,7 @@ class Repository:
         long_terms = [term for term in terms if len(term) >= 3]
         short_terms = [term for term in terms if len(term) < 3]
 
-        statement = select(Memory)
-        if not include_inactive:
-            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
+        statement = _with_statuses(select(Memory), _statuses_of(include_inactive))
         if long_terms:
             match_expression = " AND ".join('"' + term.replace('"', '""') + '"' for term in long_terms)
             statement = statement.where(
@@ -531,9 +538,9 @@ class Repository:
         include_inactive: bool = False,
     ) -> list[Memory]:
         """取某群最近的条目，新的在前。默认排除过期 / 疑似重复的条目。"""
-        statement = select(Memory).where(Memory.group_id == group_id)
-        if not include_inactive:
-            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
+        statement = _with_statuses(
+            select(Memory).where(Memory.group_id == group_id), _statuses_of(include_inactive)
+        )
         statement = statement.order_by(Memory.created_at.desc(), Memory.id.desc()).limit(limit)
         async with self._sessions() as session:
             result = await session.execute(statement)
@@ -554,9 +561,10 @@ class Repository:
         前置过滤项与 :meth:`search_memories` 一一对应：混合检索的两路必须**看到同一批
         候选**，否则 RRF 会把「被过滤掉、却在另一路里排第一」的条目捞回来。
         """
-        statement = select(Memory.id, Memory.embedding).where(func.length(Memory.embedding) > 0)
-        if not include_inactive:
-            statement = statement.where(Memory.status == MemoryStatus.ACTIVE)
+        statement = _with_statuses(
+            select(Memory.id, Memory.embedding).where(func.length(Memory.embedding) > 0),
+            _statuses_of(include_inactive),
+        )
         if category is not None:
             statement = statement.where(Memory.category == category)
         if group_id is not None:
@@ -659,7 +667,11 @@ class Repository:
         return feedback
 
     async def list_feedback(self, *, limit: int = 50) -> list[Feedback]:
-        """取最近的纠错样本，新的在前（里程碑 4 的错例集回归跑它）。"""
+        """取最近的纠错样本，新的在前。
+
+        误报样本连同原陈述的**快照**一起留在这里，供日后当提示词回归集用；
+        ``memory_id`` 可能已被清空摘掉，所以样本自身必须读得懂。
+        """
         statement = (
             select(Feedback).order_by(Feedback.created_at.desc(), Feedback.id.desc()).limit(limit)
         )

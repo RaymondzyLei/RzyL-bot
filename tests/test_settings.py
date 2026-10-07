@@ -149,3 +149,30 @@ def test_loop_intervals_read_from_environment(monkeypatch) -> None:
     assert settings.window_flush_seconds == 15
     assert settings.dead_letter_retry_seconds == 45
     assert settings.chat_timeout == 90.0
+
+
+def test_retrieval_floor_is_the_measured_value() -> None:
+    """检索下限是量出来的、不是拍的，所以把值本身也钉住。
+
+    2026-10-07 用真实模型（Qwen3-Embedding-0.6B）在 15 条真实条目上量的分布：无关对
+    最高 0.46，明显相关最低 0.56，0.5 落在这道缝里。改了它就要重做那次测量——单独一条
+    测试比写在注释里更难被忽略。
+    """
+    assert _load_settings().retrieval_min_similarity == 0.5
+    # 与去重阈值是两回事：那个问「是不是同一件事」，这个问「有没有关系」。
+    assert _load_settings().dedupe_similarity_threshold > _load_settings().retrieval_min_similarity
+
+
+def test_push_knobs_have_defaults_and_read_from_environment(monkeypatch) -> None:
+    assert _load_settings().push_enabled is True
+    assert _load_settings().push_max_entries == 50
+
+    monkeypatch.setenv("RZYL_PUSH_ENABLED", "false")
+    monkeypatch.setenv("RZYL_PUSH_MAX_ENTRIES", "5")
+    monkeypatch.setenv("RZYL_PUSH_HOUR", "7")
+    monkeypatch.setenv("RZYL_PUSH_MINUTE", "30")
+    settings = _load_settings()
+
+    assert settings.push_enabled is False
+    assert settings.push_max_entries == 5
+    assert (settings.push_hour, settings.push_minute) == (7, 30)

@@ -296,10 +296,17 @@ async def test_startup_reconcile_runs_as_a_registered_background_task(
     runtime = _runtime(tmp_path, clock)
     await runtime.start(run_background_tasks=True)
     try:
-        tasks = runtime.background_tasks
-        # 五个常驻循环 + 一个一次性对账任务。
-        assert len(tasks) == 6
-        assert "rzyl-startup-reconcile" in {task.get_name() for task in tasks}
+        names = {task.get_name() for task in runtime.background_tasks}
+        # 五个常驻循环 + 一个一次性对账任务。断言名字集合而不是条数：多一个任务时要能一眼
+        # 看出是哪个，条数变了只会看到一个数字（用户与对账都靠名字认任务）。
+        assert names == {
+            "rzyl-retention-sweep",
+            "rzyl-embedding-backfill",
+            "rzyl-window-flush",
+            "rzyl-dead-letter-retry",
+            "rzyl-daily-push",
+            "rzyl-startup-reconcile",
+        }
     finally:
         await runtime.stop()
     assert runtime.background_tasks == ()
@@ -337,10 +344,10 @@ async def test_startup_reconcile_is_skipped_when_disabled(
     try:
         await asyncio.sleep(0.05)
         # 开关关掉：没有对账任务，五个常驻循环照常（里程碑 3 起多了每日推送那个）。
-        assert len(runtime.background_tasks) == 5
         assert "rzyl-startup-reconcile" not in {
             task.get_name() for task in runtime.background_tasks
         }
+        assert len(runtime.background_tasks) == 5
         assert await runtime.repository.list_group_memories(group_id=GROUP) == []
     finally:
         await runtime.stop()
