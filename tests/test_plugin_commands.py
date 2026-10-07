@@ -126,3 +126,16 @@ def test_the_daily_report_sender_is_registered_on_import(plugin: ModuleType) -> 
 
     assert plugin is not None
     assert get_report_sender() is not None
+
+
+def test_a_rejected_command_is_logged_rather_than_silently_dropped(plugin: ModuleType) -> None:
+    """发了命令但权限不够时要留下日志，**但一个字都不能回**。
+
+    只是「不回」的话，没配 SUPERUSERS 的人（最常见就是管理员自己）只能怀疑机器人坏了；
+    回一句「无权限」又等于向陌生人确认这个命令存在。日志里带上发送者 QQ 号，正好就是
+    该填进 SUPERUSERS 的值。
+    """
+    rejected = plugin._rejected_matcher  # pyright: ignore[reportPrivateUsage]
+    assert rejected.priority > plugin.matcher.priority  # 排在真命令之后
+    assert rejected.block is False  # 真命令 block=True，超管的请求走不到这里
+    assert rejected.permission is not None  # 非 None 是 NoneBot 的默认「人人可过」，即不过滤

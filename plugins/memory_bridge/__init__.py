@@ -38,6 +38,7 @@ from rzyl_core.runtime import get_runtime_or_none
 # 这两个子模块靠 import 的副作用完成注册（命令响应器、日报投递器），必须导入。
 from . import commands, push  # noqa: F401
 from .backfill import backfill_all_groups, group_ids_from_group_list
+from .push import superuser_ids
 
 __plugin_meta__ = PluginMetadata(
     name="记忆桥",
@@ -76,6 +77,21 @@ async def _on_group_message(bot: OneBotV11Bot, event: Event) -> None:
         card=event.sender.card or None,
         platform_message_id=event.message_id,
     )
+
+
+@driver.on_startup
+async def _warn_if_no_superusers() -> None:
+    """没配 ``SUPERUSERS`` 时把后果一次说清。
+
+    这是真机上踩到的坑：命令与日报**都**要超管身份——命令靠它放行，日报靠它确定收件人。
+    两样都没配的时候，症状是「发命令没反应 + 日报没收到」，而这两种症状在日志里原本什么都
+    不留下，只能靠猜。所以启动时就把原因与动作写清楚（值要写进 ``.env``，那里已 gitignore）。
+    """
+    if not superuser_ids():
+        logger.warning(
+            "未配置 SUPERUSERS：记忆命令不会响应任何人（发来只会被静默忽略），"
+            "每日日报也没有收件人。在 .env 里加一行 SUPERUSERS=<你的QQ号> 即可启用。"
+        )
 
 
 @driver.on_bot_connect

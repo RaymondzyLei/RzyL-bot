@@ -51,6 +51,10 @@ matcher = on_message(
     block=True,
 )
 
+#: 权限不够时的日志响应器，见 :func:`_log_rejected_command`。
+#: 优先级排在真命令之后（数字更大），且 ``block=False``——真命令处理过的事件不会走到这里。
+_rejected_matcher = on_message(rule=looks_like_memory_command, priority=6, block=False)
+
 
 @matcher.handle()
 async def _handle_memory_command(bot: OneBotV11Bot, event: PrivateMessageEvent) -> None:
@@ -69,3 +73,20 @@ async def _handle_memory_command(bot: OneBotV11Bot, event: PrivateMessageEvent) 
         await matcher.finish("执行这条命令时出错了，细节见容器日志。")
     logger.info("记忆命令 %s 执行完成（ok=%s）", command.kind.value, result.ok)
     await matcher.finish(result.text)
+
+
+@_rejected_matcher.handle()
+async def _log_rejected_command(bot: OneBotV11Bot, event: PrivateMessageEvent) -> None:
+    """发了记忆命令但权限不够：**只记日志，一个字都不回**。
+
+    不回是有意的——回一句「无权限」等于向对方确认这个命令存在。但不回又会让真正该配的人
+    看不出问题：最常见的情况就是 ``SUPERUSERS`` 没配（或配错了 QQ 号），于是管理员自己
+    发命令、什么也没发生，只能怀疑机器人坏了。日志里带上发送者 QQ 号，正好就是该填进
+    ``SUPERUSERS`` 的那个值。
+    """
+    logger.warning(
+        "收到记忆命令但发送者 %s 不在 SUPERUSERS 里，已忽略（未回复）。"
+        "要在 .env 里写 SUPERUSERS=%s 才会响应。",
+        event.get_user_id(),
+        event.get_user_id(),
+    )
