@@ -44,7 +44,7 @@ def test_settings_have_documented_defaults() -> None:
     assert settings.retention_days == 30
     assert settings.push_hour == 22
     assert settings.push_minute == 0
-    assert settings.confidence_threshold == 0.7
+    assert settings.confidence_threshold == 0.75
     assert settings.group_whitelist == []
     assert settings.timezone == "Asia/Shanghai"
 
