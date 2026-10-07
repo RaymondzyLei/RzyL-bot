@@ -99,5 +99,6 @@ async def _on_bot_connect(bot: Bot) -> None:
     backfilled = await backfill_all_groups(
         bot, runtime, self_id=int(bot.self_id), now=datetime.now(timezone.utc)
     )
-    if backfilled:
-        logger.info("掉线回补共灌入 %d 条消息", backfilled)
+    # 灌入 0 条也要打这一行：否则「回补跑了但没拉到东西」与「回补根本没跑」在日志里长得
+    # 一模一样，排查时会白绕一圈（这个坑踩过一次）。
+    logger.info("掉线回补完成：本次共灌入 %d 条消息", backfilled)
