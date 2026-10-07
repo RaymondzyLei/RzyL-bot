@@ -7,12 +7,15 @@ seam 是 *Runtime*：外部依赖（聊天模型、向量、时钟、数据库�
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from rzyl_core.db import Category, Repository, WindowStatus, decode_vector
 from rzyl_core.llm import (
@@ -24,7 +27,7 @@ from rzyl_core.llm import (
     FakeChatModel,
     NullEmbedding,
 )
-from rzyl_core.llm.fakes import EchoChatModel
+from rzyl_core.llm.fakes import EchoChatModel, ReceivedPrompt
 from rzyl_core.pipeline import assemble_window
 from rzyl_core.pipeline.window import WindowMessage
 from rzyl_core.runtime import Runtime
@@ -109,7 +112,7 @@ async def test_runtime_background_task_skeletons_are_started_and_cancelled(
         "rzyl-retention-sweep",
         "rzyl-embedding-backfill",
         "rzyl-window-flush",
-        "rzyl-dead-letter-retry",
+        "rzyl-window-retry",
         "rzyl-daily-push",
     }
     assert all(not task.done() for task in runtime.background_tasks)
@@ -612,14 +615,14 @@ async def test_ingest_message_skips_the_bot_own_messages(
         await runtime.stop()
 
 
-# —— 后台任务：死信重试（里程碑 2）——
+# —— 后台任务：窗口重试（死信 + 停在 pending 的）——
 
 
 def _chat_json(text: str) -> ChatResult:
     return ChatResult(text=text, usage=ChatUsage(input_tokens=1, output_tokens=1), model="scripted")
 
 
-async def test_dead_letter_retry_reprocesses_a_dead_window_to_done(
+async def test_window_retry_reprocesses_a_dead_window_to_done(
     tmp_path: Path, clock: _Clock
 ) -> None:
     chat = FakeChatModel(
@@ -635,7 +638,7 @@ async def test_dead_letter_retry_reprocesses_a_dead_window_to_done(
         chat_model=chat,
         window_message_limit=1,
         extract_max_attempts=2,
-        dead_letter_max_retries=4,
+        window_retry_max_attempts=4,
     )
     await runtime.start(run_background_tasks=False)
     try:
@@ -643,7 +646,7 @@ async def test_dead_letter_retry_reprocesses_a_dead_window_to_done(
         timeline_window_id = ingested.outcomes[0].window_id
         assert ingested.outcomes[0].status is WindowStatus.DEAD
 
-        retried = await runtime.retry_dead_windows()
+        retried = await runtime.retry_unfinished_windows()
 
         assert retried == 1
         window = await runtime.repository.get_window(timeline_window_id)
@@ -653,7 +656,7 @@ async def test_dead_letter_retry_reprocesses_a_dead_window_to_done(
         await runtime.stop()
 
 
-async def test_dead_letter_retry_stops_at_the_configured_guard(
+async def test_window_retry_stops_at_the_configured_guard(
     tmp_path: Path, clock: _Clock
 ) -> None:
     runtime = _runtime(
@@ -662,7 +665,7 @@ async def test_dead_letter_retry_stops_at_the_configured_guard(
         chat_model=FakeChatModel([_chat_json("坏") for _ in range(10)]),
         window_message_limit=1,
         extract_max_attempts=2,
-        dead_letter_max_retries=2,
+        window_retry_max_attempts=2,
     )
     await runtime.start(run_background_tasks=False)
     try:
@@ -670,7 +673,7 @@ async def test_dead_letter_retry_stops_at_the_configured_guard(
         window_id = ingested.outcomes[0].window_id
 
         # retry_count 已达护栏（2 不小于 2），后台不再重试，也不再消耗模型脚本。
-        assert await runtime.retry_dead_windows() == 0
+        assert await runtime.retry_unfinished_windows() == 0
         window = await runtime.repository.get_window(window_id)
         assert window is not None
         assert window.status is WindowStatus.DEAD
@@ -678,7 +681,7 @@ async def test_dead_letter_retry_stops_at_the_configured_guard(
         await runtime.stop()
 
 
-async def test_dead_letter_retry_gives_up_when_the_source_messages_are_gone(
+async def test_window_retry_gives_up_when_the_source_messages_are_gone(
     tmp_path: Path, clock: _Clock
 ) -> None:
     runtime = _runtime(
@@ -687,7 +690,7 @@ async def test_dead_letter_retry_gives_up_when_the_source_messages_are_gone(
         chat_model=FakeChatModel([_chat_json("坏") for _ in range(4)]),
         window_message_limit=1,
         extract_max_attempts=2,
-        dead_letter_max_retries=4,
+        window_retry_max_attempts=4,
     )
     await runtime.start(run_background_tasks=False)
     try:
@@ -697,7 +700,7 @@ async def test_dead_letter_retry_gives_up_when_the_source_messages_are_gone(
         # 原文被保留期清掉后无法重建窗口：这一轮判它放弃（计入返回值），并把重试次数推到
         # 上限，避免每轮都白跑一次。
         await runtime.repository.delete_messages_before(BEGIN + timedelta(seconds=1))
-        assert await runtime.retry_dead_windows() == 1
+        assert await runtime.retry_unfinished_windows() == 1
 
         window = await runtime.repository.get_window(window_id)
         assert window is not None
@@ -705,7 +708,7 @@ async def test_dead_letter_retry_gives_up_when_the_source_messages_are_gone(
         assert window.retry_count >= 4
 
         # 已被推到上限，下一轮不再进入重试集合。
-        assert await runtime.retry_dead_windows() == 0
+        assert await runtime.retry_unfinished_windows() == 0
     finally:
         await runtime.stop()
 
@@ -742,3 +745,290 @@ def test_module_level_runtime_registry_raises_until_configured() -> None:
             get_runtime()
     finally:
         set_runtime(None)
+
+
+# —— 窗口重试也要捡「停在 pending」的那些（这一段修的就是那个洞）——
+
+
+class _BlockingChat:
+    """进到 ``complete`` 就挂住，直到测试放行——把「正在处理」这个状态钉在半空中。"""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def complete(self, system: str, user: str) -> ChatResult:
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return _chat_json(
+            json.dumps(
+                [
+                    {
+                        "category": "event",
+                        "statement": "处理中的那一窗",
+                        "detail": None,
+                        "confidence": 0.9,
+                        "evidence": [1],
+                        "person_refs": [],
+                        "occurred_at": None,
+                        "supersedes": None,
+                    }
+                ],
+                ensure_ascii=False,
+            )
+        )
+
+
+class _FlakyChat:
+    """前 ``failures`` 次调用抛**未预期的**异常（不是 LLMError），之后正常返回。"""
+
+    def __init__(self, failures: int, result: ChatResult | None = None) -> None:
+        self.failures = failures
+        self.calls = 0
+        #: 依次留存的 (系统提示词, 用户内容)，供断言「重试时上下文还在不在」。
+        self.received: list[ReceivedPrompt] = []
+        self._result = result or _chat_json(
+            json.dumps(
+                [
+                    {
+                        "category": "event",
+                        "statement": "实验改到周五下午三点",
+                        "detail": None,
+                        "confidence": 0.9,
+                        "evidence": [1],
+                        "person_refs": [],
+                        "occurred_at": None,
+                        "supersedes": None,
+                    }
+                ],
+                ensure_ascii=False,
+            )
+        )
+
+    async def complete(self, system: str, user: str) -> ChatResult:
+        self.received.append(ReceivedPrompt(system=system, user=user))
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("意料之外的炸")
+        return self._result
+
+
+async def test_a_window_stuck_in_pending_is_recovered_by_retry(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """核心场景：处理时撞上没被分类捕获的异常，窗口停在 ``pending``。
+
+    以前没有任何循环会去捡它，而启动对账也检测不到——消息的时间区间已经被这个窗口盖住，
+    对账的「没被任何窗口覆盖」判定因此认为它们已有归属。那段内容就永远不再被提取。
+    """
+    chat = _FlakyChat(failures=1)
+    runtime = _runtime(tmp_path, clock, chat_model=chat, window_message_limit=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        with pytest.raises(RuntimeError):
+            await runtime.ingest(group_id=GROUP, user_id=USER, text="会炸的一窗", sent_at=BEGIN)
+
+        stuck = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert len(stuck) == 1
+        window_id = int(stuck[0].id)
+        assert stuck[0].error is not None and "未预期的异常" in stuck[0].error
+        assert await runtime.repository.list_group_memories(group_id=GROUP) == []
+        # 对账这条路够不着它：消息被这个窗口的时间区间盖住了，看起来「已有归属」。
+        assert await runtime.repository.list_uncovered_messages(group_id=GROUP) == []
+
+        assert await runtime.retry_unfinished_windows() == 1
+
+        reloaded = await runtime.repository.get_window(window_id)
+        assert reloaded is not None and reloaded.status is WindowStatus.DONE
+        memories = await runtime.repository.list_group_memories(group_id=GROUP)
+        assert [m.statement for m in memories] == ["实验改到周五下午三点"]
+        # 恢复过之后就没有待重试的了。
+        assert await runtime.retry_unfinished_windows() == 0
+    finally:
+        await runtime.stop()
+
+
+async def test_a_window_stuck_in_pending_by_a_storage_failure_is_recovered(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """写库失败那条路也是 ``pending``——同样以前没人重试。"""
+    runtime = _runtime(tmp_path, clock, window_message_limit=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        original = runtime.repository.add_window_result
+        calls = {"n": 0}
+
+        async def flaky(*args: object, **kwargs: object):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OperationalError("写库炸了", None, Exception("boom"))
+            assert original is not None
+            return await original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        monkeypatch.setattr(runtime.repository, "add_window_result", flaky)
+
+        ingested = await runtime.ingest(
+            group_id=GROUP, user_id=USER, text="写库会失败的一窗", sent_at=BEGIN
+        )
+
+        # 管道判为「可重试」而不是失败：窗口保持 pending，事务已整体回滚。
+        assert ingested.outcomes[0].status is WindowStatus.PENDING
+        stuck = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert len(stuck) == 1
+        assert stuck[0].error is not None and "写库失败" in stuck[0].error
+
+        assert await runtime.retry_unfinished_windows() == 1
+
+        reloaded = await runtime.repository.get_window(int(stuck[0].id))
+        assert reloaded is not None and reloaded.status is WindowStatus.DONE
+        assert len(await runtime.repository.list_group_memories(group_id=GROUP)) == 1
+    finally:
+        await runtime.stop()
+
+
+async def test_retry_does_not_steal_a_window_that_is_still_being_processed(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """在途窗口在库里也是 ``pending``，重试循环必须绕开它，否则同一段内容会被提取两遍。
+
+    这正是「不靠时间阈值猜在不在处理中」的理由：这里让提取挂在半空中（模型不返回），
+    窗口按护栏看完全够格被重试（``retry_count=0``），只有「谁在处理」这个信息能挡住它。
+    """
+    chat = _BlockingChat()
+    runtime = _runtime(tmp_path, clock, chat_model=chat, window_message_limit=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        ingesting = asyncio.create_task(
+            runtime.ingest(group_id=GROUP, user_id=USER, text="处理中", sent_at=BEGIN)
+        )
+        await asyncio.wait_for(chat.entered.wait(), timeout=2)
+
+        pending = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert len(pending) == 1 and int(pending[0].retry_count or 0) == 0
+
+        assert await runtime.retry_unfinished_windows() == 0
+
+        chat.release.set()
+        await asyncio.wait_for(ingesting, timeout=5)
+
+        assert chat.calls == 1  # 只提取了一次，没有被重试抢走
+        assert len(await runtime.repository.list_group_memories(group_id=GROUP)) == 1
+    finally:
+        await runtime.stop()
+
+
+async def test_retry_parks_a_pending_window_whose_text_is_gone_as_a_dead_letter(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """原文被保留期清掉、还原不出内容的窗口：判为死信，别留成永远像在处理的 pending。"""
+    runtime = _runtime(tmp_path, clock, chat_model=_FlakyChat(failures=1), window_message_limit=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        with pytest.raises(RuntimeError):
+            await runtime.ingest(group_id=GROUP, user_id=USER, text="原文会被清掉", sent_at=BEGIN)
+        stuck = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert len(stuck) == 1
+        window_id = int(stuck[0].id)
+
+        # 把原文清掉（等价于保留期到期）：清理的截止时刻取自 Runtime 的时钟。
+        clock.advance(60 * 24 * 40)
+        assert await runtime.cleanup_retention() == 1
+
+        assert await runtime.retry_unfinished_windows() == 1
+
+        parked = await runtime.repository.get_window(window_id)
+        assert parked is not None
+        assert parked.status is WindowStatus.DEAD
+        assert parked.error == "原文已被保留期清理，无法重建窗口"
+        # 到顶之后不再被捡，避免每轮白跑。
+        assert await runtime.retry_unfinished_windows() == 0
+    finally:
+        await runtime.stop()
+
+
+async def test_retry_stops_at_the_configured_guard_for_pending_windows(
+    tmp_path: Path, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """护栏对 pending 也生效：一直写库失败也不能无限重试下去。"""
+    runtime = _runtime(
+        tmp_path, clock, window_message_limit=1, window_retry_max_attempts=3
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        original = runtime.repository.add_window_result
+
+        async def always_fails(*args: object, **kwargs: object):
+            raise OperationalError("库一直不可用", None, Exception("boom"))
+
+        monkeypatch.setattr(runtime.repository, "add_window_result", always_fails)
+        await runtime.ingest(group_id=GROUP, user_id=USER, text="永远写不进", sent_at=BEGIN)
+
+        # 入库那一次尝试已经把 retry_count 记成 1（管道把「尝试次数」也写在这一列）。
+        first = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert int(first[0].retry_count or 0) == 1
+
+        assert await runtime.retry_unfinished_windows() == 1  # base 1 → 2
+        assert await runtime.retry_unfinished_windows() == 1  # base 2 → 3
+        assert await runtime.retry_unfinished_windows() == 0  # base 3 到顶，不再碰
+
+        stuck = await runtime.repository.list_windows_by_status(WindowStatus.PENDING)
+        assert len(stuck) == 1 and int(stuck[0].retry_count or 0) == 3
+        assert original is not None
+    finally:
+        await runtime.stop()
+
+
+async def test_a_retried_window_is_rerun_with_the_context_it_originally_had(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """重试要等价于「把同一个窗口再跑一遍」：上一窗尾部与已记条目摘要都要在提示词里。
+
+    少了这两段，提示词短一大截，模型看不到「他说的那个」指什么、也看不到哪些事已经记过。
+    用记录提示词的假模型断言——提示词本身就是这一段的外部可观察结果。
+    """
+    chat = _FlakyChat(failures=1)
+    runtime = _runtime(tmp_path, clock, chat_model=chat, window_message_limit=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        # 先造出「已记条目」与「上一窗的最后几条」，让重试时有上下文可还原。
+        previous_window = await runtime.repository.add_window(
+            group_id=GROUP,
+            started_at=BEGIN - timedelta(minutes=10),
+            ended_at=BEGIN - timedelta(minutes=6),
+            message_count=1,
+            status=WindowStatus.DONE,
+            prompt_version="v2",
+        )
+        await runtime.repository.add_memory(
+            window_id=int(previous_window.id),
+            group_id=GROUP,
+            category=Category.KNOWLEDGE,
+            statement="上一窗已经记过的结论",
+            confidence=0.9,
+            prompt_version="v2",
+        )
+        await runtime.repository.add_message(
+            group_id=GROUP, user_id=USER, text="他说的那个实验", sent_at=BEGIN - timedelta(minutes=7)
+        )
+        await runtime.repository.add_message(
+            group_id=GROUP, user_id=USER + 1, text="就是周五那次", sent_at=BEGIN - timedelta(minutes=6)
+        )
+
+        # 窗口的首条消息比「已记条目」晚一分钟：摘要取的是「窗口开始之前已记下的条目」
+        # （按 created_at 判，实时链路里 created_at 总早于窗口首条消息的时间）。
+        window_start = BEGIN + timedelta(minutes=1)
+        with pytest.raises(RuntimeError):
+            await runtime.ingest(group_id=GROUP, user_id=USER, text="炸掉的那一窗", sent_at=window_start)
+        assert len(await runtime.repository.list_windows_by_status(WindowStatus.PENDING)) == 1
+
+        assert await runtime.retry_unfinished_windows() == 1
+
+        # 最后一次调用是重试那一次，它的用户内容里应当带上两段上下文。
+        retry_prompt = chat.received[-1]
+        assert "他说的那个实验" in retry_prompt.user
+        assert "就是周五那次" in retry_prompt.user
+        assert "[#" in retry_prompt.user and "上一窗已经记过的结论" in retry_prompt.user
+    finally:
+        await runtime.stop()

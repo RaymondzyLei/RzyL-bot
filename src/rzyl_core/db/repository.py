@@ -867,6 +867,25 @@ class Repository:
             result = await session.execute(statement)
             return list(result.scalars().all())
 
+    async def list_messages_before(
+        self, *, group_id: int, before: datetime, limit: int = 3
+    ) -> list[Message]:
+        """取某群 ``sent_at`` 严格早于 ``before`` 的**最近** ``limit`` 条原文，按时间升序。
+
+        重试一个旧窗口时用它还原「上一窗口尾部」——那段上下文只作理解用、不进 ``evidence``，
+        所以取最近几条即可（与实时链路里 ``previous_tail_size`` 的语义一致）。
+        """
+        statement = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .where(Message.sent_at < _require_aware(before, "before"))
+            .order_by(Message.sent_at.desc(), Message.id.desc())
+            .limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(reversed(list(result.scalars().all())))
+
     async def latest_message_sent_at(self, group_id: int) -> datetime | None:
         """某群**已存消息里最新一条**的发送时间；一条都没有时返回 ``None``。
 

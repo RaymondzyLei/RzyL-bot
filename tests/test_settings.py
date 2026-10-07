@@ -110,8 +110,8 @@ def test_realtime_loop_and_backfill_defaults_are_configured() -> None:
 
     # 三个后台循环的间隔都可配，都有合理默认。
     assert settings.window_flush_seconds > 0
-    assert settings.dead_letter_retry_seconds > 0
-    assert settings.dead_letter_max_retries > 0
+    assert settings.window_retry_seconds > 0
+    assert settings.window_retry_max_attempts > 0
     # 掉线回补的两条护栏：至多 24 小时或至多 N 条。
     assert settings.backfill_max_hours == 24
     assert settings.backfill_max_messages > 0
@@ -141,13 +141,13 @@ def test_chat_extra_body_rejects_a_non_object(monkeypatch) -> None:
 
 def test_loop_intervals_read_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("RZYL_WINDOW_FLUSH_SECONDS", "15")
-    monkeypatch.setenv("RZYL_DEAD_LETTER_RETRY_SECONDS", "45")
+    monkeypatch.setenv("RZYL_WINDOW_RETRY_SECONDS", "45")
     monkeypatch.setenv("RZYL_CHAT_TIMEOUT", "90")
 
     settings = _load_settings()
 
     assert settings.window_flush_seconds == 15
-    assert settings.dead_letter_retry_seconds == 45
+    assert settings.window_retry_seconds == 45
     assert settings.chat_timeout == 90.0
 
 

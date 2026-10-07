@@ -54,6 +54,7 @@ from rzyl_core.pipeline.window import (
     WindowAssembler,
     WindowMessage,
     assemble_window,
+    number_messages,
     sender_name,
     summarize_memories,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "merge_allowed_groups",
     "message_dedupe_hash",
     "normalize_statement",
+    "number_messages",
     "parse_extraction",
     "parse_onebot_message",
     "render_message_segments",

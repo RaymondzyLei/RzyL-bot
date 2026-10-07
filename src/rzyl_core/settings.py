@@ -119,15 +119,20 @@ class Settings(BaseSettings):
     window_flush_seconds: int = 60
     """窗口超时刷新循环的间隔（秒）：群里没人说话时，靠它把未满的缓冲按时成窗。"""
 
-    dead_letter_retry_seconds: int = 300
-    """死信重试循环的间隔（秒）。"""
+    window_retry_seconds: int = 300
+    """窗口重试循环的间隔（秒）：去捡没处理成的窗口（死信、以及停在 pending 的）。"""
 
-    dead_letter_max_retries: int = 5
-    """死信窗口被后台重试到 ``retry_count`` 达到该值就放弃。
+    window_retry_max_attempts: int = 5
+    """一个没处理成的窗口被后台重试到 ``retry_count`` 达到该值就放弃。
 
     ``retry_count`` 由首次失败时的尝试次数起算，之后每被后台重试一次加一：默认
-    ``extract_max_attempts=3`` 配 ``dead_letter_max_retries=5`` 大致是「首次失败后
-    再重试两轮」。达到上限就**不再重试**（窗口仍是 ``dead``），避免无限重试同一个窗口。
+    ``extract_max_attempts=3`` 配 ``window_retry_max_attempts=5`` 大致是「首次失败后
+    再重试两轮」。达到上限就**不再重试**，避免无限重试同一个窗口。
+
+    「没处理成」有两种：``dead``（模型连续失败）与 ``pending``（写库失败，或者处理时撞上
+    没被分类捕获的异常）。后者以前没人管——窗口停在 ``pending``，对账又因为「时间区间已被
+    这个窗口盖住」而检测不到，那段内容就永远不再被提取。见
+    :meth:`rzyl_core.runtime.Runtime.retry_unfinished_windows`。
     """
 
     # —— 掉线回补（里程碑 2）——

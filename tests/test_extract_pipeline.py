@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Sequence
@@ -28,6 +29,7 @@ from rzyl_core.db import (
     WindowStatus,
 )
 from rzyl_core.llm import (
+    ChatModel,
     ChatResult,
     ChatUsage,
     DeterministicEmbedding,
@@ -225,7 +227,8 @@ def test_cosine_similarity_is_bounded_and_zero_for_degenerate_input() -> None:
 def _pipeline(
     repo: Repository,
     *,
-    script: list[ChatResult | Exception],
+    script: list[ChatResult | Exception] | None = None,
+    chat_model: ChatModel | None = None,
     embedding_model: EmbeddingModel | None = None,
     **settings: object,
 ):
@@ -233,7 +236,7 @@ def _pipeline(
 
     return ExtractionPipeline(
         repository=repo,
-        chat_model=FakeChatModel(script),
+        chat_model=chat_model if chat_model is not None else FakeChatModel(script or []),
         embedding_model=embedding_model if embedding_model is not None else DeterministicEmbedding(8),
         settings=_settings(**settings),
         clock=lambda: BEGIN,
@@ -865,3 +868,60 @@ async def test_process_window_reuses_an_upstream_window_row(repo: Repository) ->
 
     assert outcome.window_id == window.id
     assert len(await repo.list_group_memories(group_id=111)) == 1
+
+
+# —— 在途窗口的登记（重试循环靠它区分「正在处理」与「没处理完」）——
+
+
+class _BlockingChat:
+    """进到 ``complete`` 就挂住，直到测试放行——用来把「正在处理」这个状态钉在半空中。"""
+
+    def __init__(self, result: ChatResult | None = None) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self._result = result or _reply([_item()])
+
+    async def complete(self, system: str, user: str) -> ChatResult:
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return self._result
+
+
+async def test_pipeline_marks_the_window_in_flight_only_while_it_processes_it(
+    repo: Repository,
+) -> None:
+    """窗口在库里的状态是 pending（「没处理完」），而有东西正在处理它——两者要能分开。"""
+    chat = _BlockingChat()
+    pipeline = _pipeline(repo, chat_model=chat)
+    assert pipeline.windows_in_flight == frozenset()
+
+    task = asyncio.create_task(pipeline.process_window(_window()))
+    await asyncio.wait_for(chat.entered.wait(), timeout=2)
+    try:
+        pending = await repo.list_windows_by_status(WindowStatus.PENDING)
+        assert len(pending) == 1
+        assert pipeline.windows_in_flight == {int(pending[0].id)}
+    finally:
+        chat.release.set()
+    outcome = await asyncio.wait_for(task, timeout=5)
+
+    assert outcome.status is WindowStatus.DONE
+    assert pipeline.windows_in_flight == frozenset()
+
+
+async def test_pipeline_releases_the_window_even_when_processing_blows_up(
+    repo: Repository,
+) -> None:
+    """失败也要放手：否则一个炸掉的窗口会被永远当成「正在处理」，变成新的一种卡死。"""
+    pipeline = _pipeline(repo, chat_model=FakeChatModel([]))  # 脚本为空 → 调用即抛
+
+    with pytest.raises(RuntimeError):
+        await pipeline.process_window(_window())
+
+    assert pipeline.windows_in_flight == frozenset()
+    pending = await repo.list_windows_by_status(WindowStatus.PENDING)
+    assert len(pending) == 1
+    # 停在 pending 的样子与「正在处理」一模一样，所以原因必须写进窗口行。
+    assert pending[0].error is not None and "未预期的异常" in pending[0].error

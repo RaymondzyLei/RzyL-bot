@@ -683,3 +683,22 @@ async def test_set_memory_status_reports_a_missing_memory(repo: Repository) -> N
     assert await repo.set_memory_status(9999, MemoryStatus.EXPIRED) is False
     reloaded = await repo.get_memory(int(memory.id))
     assert reloaded is not None and reloaded.status is MemoryStatus.EXPIRED
+
+
+async def test_list_messages_before_returns_the_nearest_older_messages(repo: Repository) -> None:
+    """重试旧窗口时靠它还原「上一窗口尾部」：取最近的几条、按时间升序回来。"""
+    for index in range(5):
+        await repo.add_message(
+            group_id=111,
+            user_id=1,
+            text=f"第 {index} 条",
+            sent_at=BEGIN + timedelta(minutes=index),
+        )
+    await repo.add_message(group_id=222, user_id=1, text="别的群", sent_at=BEGIN)
+
+    tail = await repo.list_messages_before(
+        group_id=111, before=BEGIN + timedelta(minutes=3), limit=2
+    )
+
+    assert [message.text for message in tail] == ["第 1 条", "第 2 条"]
+    assert await repo.list_messages_before(group_id=111, before=BEGIN, limit=2) == []

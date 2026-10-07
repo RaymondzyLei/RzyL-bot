@@ -25,9 +25,10 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
   见 :meth:`Runtime.check_embedding_model_ledger`），同一进程只提醒一次。
 - **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠后台循环周期把
   未满的缓冲按时成窗并入库；间隔取 ``settings.window_flush_seconds``。
-- **死信重试**（``retry_dead_windows``）：**已实现**。后台循环周期找出状态为 ``dead``
-  的窗口重跑；护栏与可观察性见 :meth:`Runtime.retry_dead_windows` 的文档字符串。
-  间隔取 ``settings.dead_letter_retry_seconds``。
+- **窗口重试**（``retry_unfinished_windows``）：**已实现**。后台循环周期找出**没处理成**
+  的窗口（``dead``，以及停在 ``pending`` 的）重跑；护栏、在途窗口为什么要跳过、以及
+  ``pending`` 这一类为什么以前会漏，见 :meth:`Runtime.retry_unfinished_windows` 的文档字符串。
+  间隔取 ``settings.window_retry_seconds``。
 - **启动对账**（``reconcile_uncovered_messages``）：**已实现**。``start()`` 打开
   ``settings.reconcile_on_startup``（默认开）时，用一个一次性后台任务把「没有被任何窗口
   时间区间覆盖」的消息重新送进窗口管道——补上「重启丢掉内存缓冲、而回补锚点又不会拉
@@ -84,6 +85,7 @@ from rzyl_core.pipeline.window import (
     WindowAssembler,
     WindowMessage,
     assemble_window,
+    number_messages,
 )
 from rzyl_core.settings import Settings
 from rzyl_core.timeutil import local_day_bounds, resolve_timezone, utcnow
@@ -120,8 +122,8 @@ PUSH_STARTUP_GRACE_SECONDS = 900
 #: 一次向量补算最多处理多少条，避免一次拉太多进内存。
 EMBEDDING_BACKFILL_BATCH = 100
 
-#: 死信重试循环一轮最多处理多少个死信窗口，避免一次拉太多进内存。
-DEAD_LETTER_RETRY_BATCH = 20
+#: 窗口重试循环一轮最多处理多少个没处理成的窗口（每类），避免一次拉太多进内存。
+WINDOW_RETRY_BATCH = 20
 
 #: 向量调用写进 ``llm_call.purpose`` 的用途标签。
 EMBED_PURPOSE = "embed"
@@ -339,11 +341,11 @@ class Runtime:
                 ),
                 asyncio.create_task(
                     self._run_periodically(
-                        self._settings.dead_letter_retry_seconds,
-                        self.retry_dead_windows,
-                        "死信重试",
+                        self._settings.window_retry_seconds,
+                        self.retry_unfinished_windows,
+                        "窗口重试",
                     ),
-                    name="rzyl-dead-letter-retry",
+                    name="rzyl-window-retry",
                 ),
                 asyncio.create_task(
                     self._run_periodically(
@@ -818,32 +820,52 @@ class Runtime:
             error=error,
         )
 
-    # —— 死信重试 ——
+    # —— 没处理成的窗口：后台重试（死信 + 停在 pending 的）——
 
-    async def retry_dead_windows(self, *, limit: int = DEAD_LETTER_RETRY_BATCH) -> int:
-        """重试状态为 ``dead`` 的窗口，返回本轮真正重试（或判定放弃）的窗口数。
+    async def retry_unfinished_windows(self, *, limit: int = WINDOW_RETRY_BATCH) -> int:
+        """重试「没处理成」的窗口，返回本轮真正重试（或判定放弃）的窗口数。
 
-        **护栏（这是重试策略的完整说明）**：只有 ``retry_count < dead_letter_max_retries``
-        的窗口才重试；每被后台重试一次，``retry_count`` 加一。首次失败时提取管道已把
-        ``retry_count`` 记为尝试次数，所以默认 ``extract_max_attempts=3`` 配
-        ``dead_letter_max_retries=5`` 大致是「首次失败后再重试两轮」，到顶就不再碰它——
-        避免同一个窗口被无限重试。窗口按编号升序处理，老死信不排队。
+        两类都会被捡起来：
 
-        重试需要把 ``window`` 行还原成一段消息再重新组装（``evidence`` 的序号要换回真实
+        - ``dead``：模型连续失败，管道判进死信；
+        - ``pending``：**本轮之前没人管的那一类**。``pending`` 在管道里是「请稍后重试」的
+          意思（写库失败时就这样返回），但原先只有 ``dead`` 有后台重试。于是只要撞上一次
+          没被分类捕获的异常（代码 bug、库不可用），窗口就停在 ``pending``：消息在
+          ``message`` 表里、窗口行也记下了时间区间——**启动对账的「没被任何窗口覆盖」判定
+          因此认为那段已有归属，两条兜底路径都够不着它**，内容再也不会被提取。
+
+        **不靠时间阈值判断「在不在处理中」**：在途窗口由管道自己登记
+        （``ExtractionPipeline.windows_in_flight``），这里直接跳过。时间阈值挡不住慢窗口
+        （单次提取最坏能到 ``extract_max_attempts × (1 + 客户端重试) × chat_timeout``，
+        十几分钟），猜一个更长的阈值只会把恢复时间一起拖长。
+
+        **护栏**：只有 ``retry_count < window_retry_max_attempts`` 的窗口才重试，每被后台
+        重试一次加一，到顶就不碰它——死信与 pending 共用这一套，避免无限重试。窗口按编号
+        升序处理（最老的先来），每轮各类至多 ``limit`` 个。
+
+        重试要把 ``window`` 行还原成一段消息再重新组装（``evidence`` 的序号要换回真实
         编号）。若原文已被保留期清掉、还原不出任何消息，就把 ``retry_count`` 直接推到上限
-        并记一条告警，避免每轮都白跑一次。可观察性：每次重试结果都写日志，``retry_count``
-        与 ``error`` 落在窗口行上，仓储可读。
+        并**判为死信**——留成 ``pending`` 会一直看起来像「正在处理」，而死信是「需要人工
+        看一眼」的那个状态。可观察性：每次重试结果都写日志，``retry_count`` 与 ``error``
+        落在窗口行上，仓储可读。
         """
         repository = self._require_repository()
         pipeline = self._require_pipeline()
-        max_retries = self._settings.dead_letter_max_retries
-        windows = await repository.list_windows_by_status(WindowStatus.DEAD, limit=limit)
+        in_flight = pipeline.windows_in_flight
+        max_retries = self._settings.window_retry_max_attempts
+        candidates = [
+            *await repository.list_windows_by_status(WindowStatus.DEAD, limit=limit),
+            *await repository.list_windows_by_status(WindowStatus.PENDING, limit=limit),
+        ]
         touched = 0
-        for window in windows:
+        for window in candidates:
             window_id = int(window.id)
+            if window_id in in_flight:
+                continue
             base = int(window.retry_count or 0)
             if base >= max_retries:
                 continue
+            why = "死信" if window.status is WindowStatus.DEAD else "未完成"
             assembled = await self._rebuild_window(repository, window)
             if assembled is None:
                 await repository.update_window_status(
@@ -853,20 +875,33 @@ class Runtime:
                     error="原文已被保留期清理，无法重建窗口",
                 )
                 logger.warning(
-                    "死信窗口 %s（群 %s）的原文已不在，放弃重试", window_id, window.group_id
+                    "%s窗口 %s（群 %s）的原文已不在，放弃重试", why, window_id, window.group_id
                 )
                 touched += 1
                 continue
             outcome = await pipeline.process_window(assembled, window_id=window_id)
-            if outcome.status is WindowStatus.DEAD:
+            if outcome.status is WindowStatus.DONE:
+                logger.info("%s窗口 %s 重试后处理完成", why, window_id)
+            elif outcome.status is WindowStatus.DEAD:
                 await repository.update_window_status(
                     window_id, WindowStatus.DEAD, retry_count=base + 1, error=outcome.error
                 )
                 logger.warning(
-                    "死信窗口 %s 第 %d 次重试仍失败：%s", window_id, base + 1, outcome.error
+                    "%s窗口 %s 第 %d 次重试仍失败：%s", why, window_id, base + 1, outcome.error
                 )
             else:
-                logger.info("死信窗口 %s 重试后状态变为 %s", window_id, outcome.status.value)
+                # 管道保持 pending（写库又失败了）：计数要单调递增，否则这一行会在 0/1 之间
+                # 来回跳，护栏永远到不了顶、变成无限重试。
+                await repository.update_window_status(
+                    window_id, WindowStatus.PENDING, retry_count=base + 1, error=outcome.error
+                )
+                logger.warning(
+                    "%s窗口 %s 第 %d 次重试仍未完成：%s",
+                    why,
+                    window_id,
+                    base + 1,
+                    outcome.error,
+                )
             touched += 1
         return touched
 
@@ -878,13 +913,23 @@ class Runtime:
         取该群 ``started_at`` 与 ``ended_at``（含两端）之间的原文；找不到（原文被保留期
         清掉）或窗口没记时间时返回 ``None``。超出 ``message_count`` 的部分砍掉，保证还原
         出的窗口与当初处理的那一段一致。
+
+        **上下文也一起还原**（上一窗尾部 + 已记条目摘要）：重试的语义是「把同一个窗口再跑
+        一遍」，少了这两段就不是同一件事了——提示词短一大截，模型既看不到「他说的那个」指
+        什么，也看不到哪些事已经记过。真机上量过：窗口 42 不带上下文时提示词 296 字、两次
+        提取得到 0 条 / 1 条；带上之后 680 字、1 条 / 1 条（那段内容原本产出过 3 条）。
+
+        尾部取「``started_at`` 之前最近的若干条」、摘要取「``started_at`` 之前已记的条目」，
+        都是当时那一次能看到的东西（摘要按 ``created_at`` 判——实时链路里它总早于窗口首条
+        消息的时间，所以这个判据与「当时已记下的」是一回事）。
         """
         started_at = window.started_at
         ended_at = window.ended_at
         if started_at is None or ended_at is None:
             return None
+        group_id = int(window.group_id)
         stored = await repository.list_messages_between(
-            group_id=int(window.group_id),
+            group_id=group_id,
             since=started_at,
             until=ended_at,
             limit=max(int(window.message_count or 0) + 5, 50),
@@ -895,9 +940,17 @@ class Runtime:
             messages = messages[:count]
         if not messages:
             return None
+        tail_source = await repository.list_messages_before(
+            group_id=group_id, before=started_at, limit=self._previous_tail_size
+        )
+        remembered = await repository.list_memories_in_range(
+            group_id=group_id, until=started_at, limit=self._remembered_limit
+        )
         return assemble_window(
-            group_id=int(window.group_id),
+            group_id=group_id,
             messages=messages,
+            previous_tail=number_messages([WindowMessage.from_message(m) for m in tail_source]),
+            remembered=remembered,
             prompt_version=window.prompt_version,
         )
 
@@ -1159,7 +1212,7 @@ class Runtime:
 
 __all__ = [
     "DAILY_REPORT_FETCH_LIMIT",
-    "DEAD_LETTER_RETRY_BATCH",
+    "WINDOW_RETRY_BATCH",
     "EMBEDDING_BACKFILL_BATCH",
     "EMBEDDING_SWEEP_SECONDS",
     "EMBED_PURPOSE",

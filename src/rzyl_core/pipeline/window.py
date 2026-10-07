@@ -233,6 +233,26 @@ class AssembledWindow:
         )
 
 
+def number_messages(messages: Sequence[WindowMessage]) -> tuple[SequencedMessage, ...]:
+    """把一段消息按传入顺序编号成「窗口里的行」（序号 1 起）。
+
+    本窗口正文与「上一窗口尾部」都靠它编号，所以只在这里实现一次——重试一个旧窗口时
+    （见 :meth:`rzyl_core.runtime.Runtime._rebuild_window`）也要用它把尾部还原成同样的形状。
+    """
+    return tuple(
+        SequencedMessage(
+            sequence=index,
+            message_id=message.message_id,
+            group_id=message.group_id,
+            user_id=message.user_id,
+            sender=message.sender,
+            text=message.text,
+            sent_at=message.sent_at,
+        )
+        for index, message in enumerate(messages, start=1)
+    )
+
+
 def assemble_window(
     *,
     group_id: int,
@@ -249,21 +269,9 @@ def assemble_window(
     """
     if not messages:
         raise ValueError("不能组装空窗口")
-    numbered = tuple(
-        SequencedMessage(
-            sequence=index,
-            message_id=message.message_id,
-            group_id=message.group_id,
-            user_id=message.user_id,
-            sender=message.sender,
-            text=message.text,
-            sent_at=message.sent_at,
-        )
-        for index, message in enumerate(messages, start=1)
-    )
     return AssembledWindow(
         group_id=group_id,
-        messages=numbered,
+        messages=number_messages(messages),
         previous_tail=tuple(previous_tail),
         remembered=tuple(remembered),
         remembered_summary=(
@@ -432,6 +440,7 @@ __all__ = [
     "WindowAssembler",
     "WindowMessage",
     "assemble_window",
+    "number_messages",
     "sender_name",
     "summarize_memories",
 ]

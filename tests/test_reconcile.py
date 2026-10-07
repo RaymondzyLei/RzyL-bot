@@ -303,7 +303,7 @@ async def test_startup_reconcile_runs_as_a_registered_background_task(
             "rzyl-retention-sweep",
             "rzyl-embedding-backfill",
             "rzyl-window-flush",
-            "rzyl-dead-letter-retry",
+            "rzyl-window-retry",
             "rzyl-daily-push",
             "rzyl-startup-reconcile",
         }

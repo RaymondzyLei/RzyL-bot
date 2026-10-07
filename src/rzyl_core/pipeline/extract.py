@@ -330,6 +330,21 @@ class ExtractionPipeline:
         self._clock = clock
         self._provider = provider
         self._timezone = resolve_timezone(settings.timezone)
+        #: 正在处理的窗口编号。窗口在库里的状态是 ``pending``（「还没处理完」），而后台重试
+        #: 循环要能区分「还没处理完」与「正在处理」——不区分就会与本次处理抢同一个窗口，
+        #: 同一段内容被提取两遍。这份登记就是那个区分，见 :attr:`windows_in_flight`。
+        self._in_flight: set[int] = set()
+
+    @property
+    def windows_in_flight(self) -> frozenset[int]:
+        """本管道正在处理的窗口编号。
+
+        给后台重试循环用：这些窗口虽然显示为 ``pending``，但**有人正在处理**，重试循环
+        必须跳过它们。这是「不靠时间阈值猜在不在处理中」的做法——时间阈值挡不住慢窗口
+        （单次提取最坏可以耗掉 ``extract_max_attempts × (1 + 客户端重试) × chat_timeout``，
+        十几分钟），而猜一个更长的阈值只会把恢复时间也一起拖长。
+        """
+        return frozenset(self._in_flight)
 
     async def process_window(
         self, window: AssembledWindow, *, window_id: int | None = None
@@ -338,8 +353,39 @@ class ExtractionPipeline:
 
         ``window_id`` 缺省时为本窗口新建 ``window`` 行；传已存在的编号则复用它（上游若已
         建好窗口就不再重复建）。
+
+        这一层只负责「认领 → 处理 → 放手」：认领就是把窗口编号记进在途集合（首个
+        ``await`` 之前登记，所以并发方看不见半成品），放手在 ``finally`` 里，**处理失败也
+        会放手**——否则一个失败的窗口会被永远当成「正在处理」，反而变成新的一种卡死。
+
+        意外异常（不是模型报错、也不是写库错的那种，例如代码 bug）除了原样抛出，还会**先
+        把原因写进窗口行**：不然它停在 ``pending`` 的样子与「正在处理」一模一样，看库的人
+        完全分不出是哪个。
         """
         target_window_id = window_id if window_id is not None else await self._ensure_window(window)
+        self._in_flight.add(target_window_id)
+        try:
+            return await self._process_attempts(window, target_window_id)
+        except Exception as exc:
+            try:
+                await self._mark_retryable(
+                    target_window_id, 0, f"未预期的异常：{exc!r}"
+                )
+            except Exception:
+                # 连「记下失败原因」都失败（多半是库不可用），不能再把原来的异常盖掉。
+                logger.exception("窗口 %s 记不下这次失败的原因", target_window_id)
+            raise
+        finally:
+            self._in_flight.discard(target_window_id)
+
+    async def _process_attempts(
+        self, window: AssembledWindow, target_window_id: int
+    ) -> ExtractionOutcome:
+        """按 ``extract_max_attempts`` 重试地处理一个已认领的窗口。
+
+        从 ``process_window`` 里整段搬出来的，只为了让「认领 / 放手」那一层读起来只有
+        认领与放手；这里的逻辑与搬之前逐字相同。
+        """
         attempts = 0
         last_error: str | None = None
         #: 早先某次尝试产出过非空候选内容的次数（1 起）；只用于「内容可能被丢弃」的可观测性。
