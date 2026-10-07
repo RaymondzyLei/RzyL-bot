@@ -8,11 +8,19 @@
    摘要里带 ``[#编号]``，模型的 ``supersedes`` 引用的就是它。
 3. **本窗口消息**——每条带**窗口内序号**（1 起），模型的 ``evidence`` 引用的就是序号。
 
-成窗规则：**条数或时间先到者**，每个群各自独立缓冲。时间判定看的是**消息自己的**
-``sent_at``：新消息与缓冲首条的时间跨度达到上限就把缓冲关成窗口，这条新消息属于下一个
-窗口。这样实时链路、离线回放与里程碑 2 的掉线回补（用当下时钟灌一批历史消息）三条路径
-都正确，回放也不必再「把时钟拨到消息时间」。只有 :meth:`WindowAssembler.flush_expired`
-在无人再来消息时用注入时钟判断缓冲是否已跨过窗口——那时拿当下时钟比是对的。
+成窗规则：**三条任一成立即关**，每个群各自独立缓冲：
+
+1. **条数上限**：本窗口条数达到 ``window_message_limit``——无条件成窗。
+2. **时间到点**：新消息与缓冲首条的时间跨度达到 ``window_minutes``，**且**缓冲里条数不少于
+   ``window_min_messages``——成窗。条数不够就继续攒着，避免稀疏流量下把只有一两条消息的
+   缓冲也收掉、白调一次模型。
+3. **兜底年龄**：缓冲里最老那条消息的年龄达到 ``window_max_minutes``——无条件成窗，不看条数。
+   没有它，一个只发了一句话就安静下来的群，那条消息会无限期滞留、永远不会被提取。
+
+时间判定看的是**消息自己的** ``sent_at``：在 :meth:`WindowAssembler.add` 里判定「已有缓冲
+该不该关」时，"当下"取**本条新消息的** ``sent_at``（回放与掉线回补灌历史消息时这样才正确，
+不必再「把时钟拨到消息时间」）；只有 :meth:`WindowAssembler.flush_expired` 在无人再来消息时
+用注入时钟当"当下"。
 
 给下游的契约（#7 提取入库要接）：
 
@@ -277,7 +285,10 @@ def summarize_memories(memories: Sequence[Memory]) -> str:
 
 
 class WindowAssembler:
-    """按群独立缓冲消息，攒满条数或到点就成窗。
+    """按群独立缓冲消息，满足三条关窗规则之一就成窗。
+
+    规则：条数到 ``window_message_limit``；时间跨度到 ``window_minutes`` 且条数不少于
+    ``window_min_messages``；或最老消息年龄到 ``window_max_minutes``（兜底）。
 
     构造时注入仓储、时钟与设置。时钟只供 :meth:`flush_expired`（群里没人说话时收尾）
     使用；:meth:`add` 的成窗时间判定完全基于消息自身的 ``sent_at``，与注入时钟无关。
@@ -305,7 +316,9 @@ class WindowAssembler:
         self._repository = repository
         self._clock = clock
         self._message_limit = settings.window_message_limit
+        self._min_messages = settings.window_min_messages
         self._span = timedelta(minutes=settings.window_minutes)
+        self._max_age = timedelta(minutes=settings.window_max_minutes)
         self._previous_tail_size = previous_tail_size
         self._remembered_limit = remembered_limit
         self._prompt_version = prompt_version or current_prompt_version()
@@ -327,8 +340,10 @@ class WindowAssembler:
 
         可直接传仓储的 ``Message``（内部会适配），也可传 :class:`WindowMessage`。
 
-        若这条消息与缓冲首条的时间跨度已达窗口上限，先把已有缓冲关掉再收这条——
-        **先到者成窗**，新消息属于下一个窗口。判定只看消息自身的 ``sent_at``，
+        收这条之前先判**已有缓冲**该不该关，"当下"取**这条新消息的** ``sent_at``：条数到
+        ``window_message_limit``、跨度到 ``window_minutes`` 且条数不少于
+        ``window_min_messages``、或最老消息年龄到 ``window_max_minutes``——任一成立就先把
+        缓冲关掉再收这条（**新消息属于下一个窗口**）。判定只看消息自身的 ``sent_at``，
         不看注入时钟，所以回放与掉线回补灌历史消息时也能正确切窗。
         """
         normalized = _as_window_message(message)
@@ -336,7 +351,7 @@ class WindowAssembler:
         buffer = self._buffers.setdefault(group_id, [])
         windows: list[AssembledWindow] = []
 
-        if buffer and normalized.sent_at - buffer[0].sent_at >= self._span:
+        if buffer and self._should_close(buffer, normalized.sent_at):
             windows.append(await self._close(group_id, buffer))
             buffer = self._buffers[group_id] = []
 
@@ -347,6 +362,21 @@ class WindowAssembler:
 
         return windows
 
+    def _should_close(self, buffer: Sequence[WindowMessage], now: datetime) -> bool:
+        """缓冲在 ``now`` 这一刻是否该关窗（三条规则任一成立）。
+
+        ``now`` 在 :meth:`add` 里是本条新消息的 ``sent_at``，在 :meth:`flush_expired` 里是
+        注入时钟给的当下。三条规则：条数到 ``window_message_limit``；跨度到
+        ``window_minutes`` 且条数不少于 ``window_min_messages``；最老消息年龄到
+        ``window_max_minutes``。
+        """
+        age = now - buffer[0].sent_at
+        return (
+            len(buffer) >= self._message_limit
+            or (age >= self._span and len(buffer) >= self._min_messages)
+            or age >= self._max_age
+        )
+
     async def flush_group(self, group_id: int) -> AssembledWindow | None:
         """不管满没满，立刻把某群的缓冲关成一个窗口；没有缓冲则返回 ``None``。"""
         buffer = self._buffers.get(group_id)
@@ -356,15 +386,18 @@ class WindowAssembler:
         return await self._close(group_id, buffer)
 
     async def flush_expired(self) -> list[AssembledWindow]:
-        """把已经到时间上限的群窗口全部关掉。
+        """把该关的群窗口全部关掉。
 
-        给后台定时任务用：群里没人说话时，也要有东西去触发成窗。
+        给后台定时任务用：群里没人说话时，也要有东西去触发成窗。"当下"取注入时钟——
+        条数到上限、跨度到 ``window_minutes`` 且条数不少于 ``window_min_messages``、或最老
+        消息年龄到 ``window_max_minutes``（兜底）任一成立就关。因此只有一两条消息的安静
+        窗口最多滞留 ``window_max_minutes`` 就会被收掉，不会被无限期留在内存里。
         """
         now = self._clock()
         windows: list[AssembledWindow] = []
         for group_id in sorted(self._buffers):
             buffer = self._buffers[group_id]
-            if buffer and now - buffer[0].sent_at >= self._span:
+            if buffer and self._should_close(buffer, now):
                 self._buffers[group_id] = []
                 windows.append(await self._close(group_id, buffer))
         return windows

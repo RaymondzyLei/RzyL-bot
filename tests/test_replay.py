@@ -50,7 +50,7 @@ async def _runtime(tmp_path: Path) -> Runtime:
     runtime = Runtime(
         chat_model=EchoChatModel(),
         embedding_model=DeterministicEmbedding(8),
-        settings=_settings(window_message_limit=3, window_minutes=5),
+        settings=_settings(window_message_limit=3, window_minutes=5, window_min_messages=2),
         clock=_Clock(datetime(2030, 1, 1, 0, 0, tzinfo=CST)),
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'rzyl.db'}",
         provider="offline",
@@ -196,7 +196,7 @@ async def test_dry_run_touches_no_database_at_all(tmp_path: Path) -> None:
     runtime = Runtime(
         chat_model=EchoChatModel(),
         embedding_model=DeterministicEmbedding(8),
-        settings=_settings(window_message_limit=3, window_minutes=5),
+        settings=_settings(window_message_limit=3, window_minutes=5, window_min_messages=2),
         clock=_Clock(datetime(2030, 1, 1, 0, 0, tzinfo=CST)),
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'rzyl.db'}",
     )

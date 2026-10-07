@@ -21,13 +21,20 @@ CST = timezone(timedelta(hours=8))
 BEGIN = datetime(2026, 10, 7, 9, 0, tzinfo=CST)
 
 
-def _message(message_id: int, *, group_id: int = 111, text: str | None = None, minutes: int = 0) -> WindowMessage:
+def _message(
+    message_id: int,
+    *,
+    group_id: int = 111,
+    text: str | None = None,
+    minutes: int = 0,
+    seconds: int = 0,
+) -> WindowMessage:
     return WindowMessage(
         message_id=message_id,
         group_id=group_id,
         user_id=10000 + message_id,
         text=text if text is not None else f"第{message_id}条",
-        sent_at=BEGIN + timedelta(minutes=minutes),
+        sent_at=BEGIN + timedelta(minutes=minutes, seconds=seconds),
         nickname=f"用户{message_id}",
     )
 
@@ -39,10 +46,22 @@ async def repo(tmp_path: Path) -> AsyncGenerator[Repository, None]:
     await instance.close()
 
 
-def _settings(*, limit: int = 30, minutes: int = 5) -> Settings:
+def _settings(
+    *,
+    limit: int = 30,
+    minutes: int = 5,
+    min_messages: int = 5,
+    max_minutes: int = 60,
+) -> Settings:
     """窗口参数可调、其余用默认值的设置对象。"""
     # ``_env_file`` 是 pydantic-settings 的运行时开关，类型签名里没有，故忽略告警。
-    return Settings(_env_file=None, window_message_limit=limit, window_minutes=minutes)  # pyright: ignore[reportCallIssue]
+    return Settings(
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+        window_message_limit=limit,
+        window_minutes=minutes,
+        window_min_messages=min_messages,
+        window_max_minutes=max_minutes,
+    )
 
 
 class _Clock:
@@ -111,14 +130,15 @@ async def test_time_limit_closes_the_window_before_the_new_message(repo: Reposit
     clock = _Clock()
     assembler = WindowAssembler(repository=repo, clock=clock, settings=_settings(limit=30))
 
-    await assembler.add(_message(1, minutes=0))
-    await assembler.add(_message(2, minutes=1))
+    # 时间规则要求缓冲里至少有 window_min_messages 条，先攒满 5 条。
+    for index in range(5):
+        assert await assembler.add(_message(index + 1, minutes=index)) == []
     clock.advance(5)
 
-    windows = await assembler.add(_message(3, minutes=6))
+    windows = await assembler.add(_message(6, minutes=5))
 
     assert len(windows) == 1
-    assert [line.message_id for line in windows[0].messages] == [1, 2]
+    assert [line.message_id for line in windows[0].messages] == [1, 2, 3, 4, 5]
     assert assembler.buffered_count(111) == 1
 
 
@@ -128,16 +148,96 @@ async def test_flush_expired_closes_a_quiet_window(repo: Repository) -> None:
     clock = _Clock()
     assembler = WindowAssembler(repository=repo, clock=clock, settings=_settings(limit=30))
 
-    await assembler.add(_message(1, minutes=0))
-    await assembler.add(_message(2, minutes=1))
+    # 条数够 window_min_messages，时间到点才成窗。
+    for index in range(5):
+        await assembler.add(_message(index + 1, minutes=index))
     assert await assembler.flush_expired() == []
 
     clock.advance(5)
     windows = await assembler.flush_expired()
 
-    assert [window.message_count for window in windows] == [2]
+    assert [window.message_count for window in windows] == [5]
     assert assembler.buffered_count(111) == 0
     assert await assembler.flush_expired() == []
+
+
+async def test_sparse_traffic_keeps_buffering_until_the_minimum_is_reached(
+    repo: Repository,
+) -> None:
+    """稀疏流量：每 30 分钟才来一条，够 window_min_messages 之前都不成窗。
+
+    把 window_max_minutes 调大，把「最小条数」这条规则单独隔离出来测。
+    """
+    from rzyl_core.pipeline import WindowAssembler
+
+    assembler = WindowAssembler(
+        repository=repo,
+        clock=_Clock(),
+        settings=_settings(limit=30, minutes=5, min_messages=5, max_minutes=240),
+    )
+
+    # 每 30 分钟一条，前 5 条都留在同一个缓冲里：跨度早早超过 window_minutes，
+    # 但条数不够，所以一条都不成窗。
+    windows = []
+    for index in range(5):
+        windows.extend(await assembler.add(_message(index + 1, minutes=30 * index)))
+
+    assert windows == []
+    assert assembler.buffered_count(111) == 5
+
+    # 第 6 条到达时，缓冲已有 5 条（够最小条数）、跨度 150 分钟（到时间点）→ 成窗。
+    windows = await assembler.add(_message(6, minutes=150))
+
+    assert len(windows) == 1
+    assert [line.message_id for line in windows[0].messages] == [1, 2, 3, 4, 5]
+    assert assembler.buffered_count(111) == 1
+
+
+async def test_max_minutes_fallback_flushes_a_lonely_message(repo: Repository) -> None:
+    """兜底：只来一条就安静，window_max_minutes 之前不收、之后无条件收。"""
+    from rzyl_core.pipeline import WindowAssembler
+
+    clock = _Clock()
+    assembler = WindowAssembler(
+        repository=repo,
+        clock=clock,
+        settings=_settings(limit=30, minutes=5, min_messages=5, max_minutes=60),
+    )
+
+    await assembler.add(_message(1, minutes=0))
+
+    # 59 分钟：时间规则因条数不够不触发，兜底也还差一点。
+    clock.advance(59)
+    assert await assembler.flush_expired() == []
+    assert assembler.buffered_count(111) == 1
+
+    # 到 60 分钟：兜底无条件关窗，哪怕只有 1 条。
+    clock.advance(1)
+    windows = await assembler.flush_expired()
+
+    assert [window.message_count for window in windows] == [1]
+    assert [line.message_id for line in windows[0].messages] == [1]
+    assert assembler.buffered_count(111) == 0
+
+
+async def test_message_limit_wins_over_the_minimum_within_an_hour(repo: Repository) -> None:
+    """上限优先：一小时内猛灌 30 条，条数上限先触发，不受最小条数影响。"""
+    from rzyl_core.pipeline import WindowAssembler
+
+    assembler = WindowAssembler(
+        repository=repo,
+        clock=_Clock(),
+        settings=_settings(limit=30, minutes=5, min_messages=5, max_minutes=60),
+    )
+
+    # 30 条压在 5 分钟内（每 8 秒一条）：时间规则来不及触发，只有条数上限会先到。
+    windows = []
+    for index in range(30):
+        windows.extend(await assembler.add(_message(index + 1, seconds=8 * index)))
+
+    assert len(windows) == 1
+    assert windows[0].message_count == 30
+    assert assembler.buffered_count(111) == 0
 
 
 async def test_windowing_follows_message_times_not_a_frozen_clock(repo: Repository) -> None:

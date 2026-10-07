@@ -18,6 +18,24 @@ def _load_settings() -> Settings:
     return Settings(_env_file=None)  # pyright: ignore[reportCallIssue]
 
 
+def test_window_gating_defaults_cover_sparse_traffic() -> None:
+    """窗口下限与兜底上限的默认值：稀疏流量不被时间窗过早收掉，也不会无限期滞留。"""
+    settings = _load_settings()
+
+    assert settings.window_min_messages == 5
+    assert settings.window_max_minutes == 60
+
+
+def test_window_gating_reads_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("RZYL_WINDOW_MIN_MESSAGES", "3")
+    monkeypatch.setenv("RZYL_WINDOW_MAX_MINUTES", "90")
+
+    settings = _load_settings()
+
+    assert settings.window_min_messages == 3
+    assert settings.window_max_minutes == 90
+
+
 def test_settings_have_documented_defaults() -> None:
     settings = _load_settings()
 
