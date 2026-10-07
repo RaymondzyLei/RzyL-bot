@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -71,6 +71,12 @@ class HistoryMessage:
     card: str | None = None
     platform_message_id: int | None = None
     message_seq: int | None = None
+    segments: tuple[dict[str, Any], ...] = ()
+    """原始消息段（OB11 形状）；只有记录里带 ``message`` 段时才有值。
+
+    掉线回补用它渲染出与**实时链路一致**的文本与 ``segments_json``——否则同一张图/
+    同一个文件在两条路上渲染成的文本不同，内容 hash 去重会失效。样本文件来源不填。
+    """
 
 
 def message_dedupe_hash(
@@ -82,6 +88,28 @@ def message_dedupe_hash(
     """
     material = f"{group_id}|{user_id}|{sent_at.astimezone(timezone.utc).isoformat()}|{text}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def resolve_backfill_since(
+    *, anchor: datetime | None, now: datetime, max_hours: int
+) -> tuple[datetime, bool]:
+    """算出回补的起点时间，并返回是否被时间护栏截断。
+
+    锚点是该群最后一条已存消息的时间；护栏是「至多回补最近 ``max_hours`` 小时」。
+    起点取锚点与 ``now - max_hours`` 里**较晚**的一个：
+
+    - 锚点比护栏下限更早（或压根没有锚点）→ 用下限，第二项为 ``True``（只有真的因为
+      护栏截断才为真；没有锚点不算「超了护栏」）；调用方据此记一条告警。
+    - 锚点在护栏之内 → 用锚点，第二项为 ``False``。
+
+    纯函数、可注入 ``now``，所以护栏行为能脱离时钟单测。
+    """
+    floor = now - timedelta(hours=max_hours)
+    if anchor is None:
+        return floor, False
+    if anchor < floor:
+        return floor, True
+    return anchor, False
 
 
 @runtime_checkable
@@ -257,37 +285,14 @@ class OneBotHistorySource:
         since: datetime | None = None,
         limit: int | None = None,
     ) -> list[HistoryMessage]:
-        collected: list[HistoryMessage] = []
-        seen: set[Any] = set()
-        cursor = 0
-        while True:
-            page = await self._request_page(group_id=group_id, message_seq=cursor)
-            parsed: list[HistoryMessage] = []
-            for record in page:
-                key = record.get("message_seq", record.get("message_id"))
-                if key is not None:
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                parsed.append(self._parse(group_id, record))
-            if not parsed:
-                break
-
-            collected = parsed + collected
-            oldest = min(parsed, key=lambda message: message.sent_at)
-            if since is not None and oldest.sent_at <= since:
-                break
-            if limit is not None and len(collected) >= limit:
-                break
-            sequences = [
-                message.message_seq for message in parsed if message.message_seq is not None
-            ]
-            next_cursor = (min(sequences) - 1) if sequences else 0
-            if next_cursor <= 0:
-                break
-            cursor = next_cursor
-
-        return _apply_since_and_limit(_sort_by_time(collected), since=since, limit=limit)
+        return await fetch_onebot_history(
+            group_id=group_id,
+            fetch_page=lambda message_seq: self._request_page(
+                group_id=group_id, message_seq=message_seq
+            ),
+            since=since,
+            limit=limit,
+        )
 
     async def _request_page(self, *, group_id: int, message_seq: int) -> list[dict[str, Any]]:
         url = f"{self._api_root}/{GROUP_MESSAGE_HISTORY_ACTION}"
@@ -320,39 +325,106 @@ class OneBotHistorySource:
 
     @staticmethod
     def _parse(group_id: int, record: dict[str, Any]) -> HistoryMessage:
-        if not isinstance(record, dict):
-            raise HistoryFetchError(f"历史消息不是对象：{type(record).__name__}")
-        raw_time = record.get("time")
-        if not isinstance(raw_time, int | float) or isinstance(raw_time, bool):
-            raise HistoryFetchError(f"历史消息缺少可用的 time 字段：{raw_time!r}")
-        sent_at = datetime.fromtimestamp(int(raw_time), tz=timezone.utc)
+        """兼容入口：等价于模块级 :func:`parse_onebot_message`。"""
+        return parse_onebot_message(group_id, record)
 
-        sender = record.get("sender")
-        sender = sender if isinstance(sender, dict) else {}
-        user_id = sender.get("user_id", record.get("user_id"))
-        if not isinstance(user_id, int) or isinstance(user_id, bool):
-            raise HistoryFetchError(f"历史消息缺少可用的 sender.user_id：{user_id!r}")
 
-        raw_message_id = record.get("message_id")
-        raw_seq = record.get("message_seq")
-        nickname = sender.get("nickname")
-        card = sender.get("card")
-        return HistoryMessage(
-            group_id=group_id,
-            user_id=user_id,
-            text=_render_record_text(record),
-            sent_at=sent_at,
-            nickname=nickname if isinstance(nickname, str) else None,
-            card=card if isinstance(card, str) and card else None,
-            platform_message_id=(
-                raw_message_id
-                if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool)
-                else None
-            ),
-            message_seq=(
-                raw_seq if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) else None
-            ),
-        )
+def parse_onebot_message(group_id: int, record: dict[str, Any]) -> HistoryMessage:
+    """把一条 OneBot 原始消息 dict 转成内部 :class:`HistoryMessage`。
+
+    HTTP 历史来源与插件侧 ``bot.call_api("get_group_msg_history")`` 的回补共用这一处：
+    时间取 unix 秒并按 UTC 落带时区的 ``datetime``；发送者取 ``sender.user_id``
+    （退回顶层 ``user_id``）；文本按消息段渲染（没有 ``message`` 段时退回 ``raw_message``）。
+    缺必需字段就抛 :class:`HistoryFetchError`，宁可当场失败也不落一条残缺消息。
+    """
+    if not isinstance(record, dict):
+        raise HistoryFetchError(f"历史消息不是对象：{type(record).__name__}")
+    raw_time = record.get("time")
+    if not isinstance(raw_time, int | float) or isinstance(raw_time, bool):
+        raise HistoryFetchError(f"历史消息缺少可用的 time 字段：{raw_time!r}")
+    sent_at = datetime.fromtimestamp(int(raw_time), tz=timezone.utc)
+
+    sender = record.get("sender")
+    sender = sender if isinstance(sender, dict) else {}
+    user_id = sender.get("user_id", record.get("user_id"))
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        raise HistoryFetchError(f"历史消息缺少可用的 sender.user_id：{user_id!r}")
+
+    raw_message_id = record.get("message_id")
+    raw_seq = record.get("message_seq")
+    nickname = sender.get("nickname")
+    card = sender.get("card")
+    raw_segments = record.get("message")
+    segments: tuple[dict[str, Any], ...] = (
+        tuple(item for item in raw_segments if isinstance(item, dict))
+        if isinstance(raw_segments, list)
+        else ()
+    )
+    return HistoryMessage(
+        group_id=group_id,
+        user_id=user_id,
+        text=_render_record_text(record),
+        sent_at=sent_at,
+        nickname=nickname if isinstance(nickname, str) else None,
+        card=card if isinstance(card, str) and card else None,
+        platform_message_id=(
+            raw_message_id
+            if isinstance(raw_message_id, int) and not isinstance(raw_message_id, bool)
+            else None
+        ),
+        message_seq=(
+            raw_seq if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) else None
+        ),
+        segments=segments,
+    )
+
+
+async def fetch_onebot_history(
+    *,
+    group_id: int,
+    fetch_page: Callable[[int], Awaitable[list[dict[str, Any]]]],
+    since: datetime | None = None,
+    limit: int | None = None,
+) -> list[HistoryMessage]:
+    """按 ``message_seq`` 向更早翻页拉某群历史，返回时间升序的 :class:`HistoryMessage`。
+
+    ``fetch_page(message_seq)`` 返回一页原始消息（``0`` 表示最新一页）。翻页规则与
+    :class:`OneBotHistorySource` 完全一致：首请求取最新一页，之后用本页最老的
+    ``message_seq - 1`` 继续向更早要，落到 0 或本页没消息就停；落地前按时间排一次并
+    去重。把 HTTP 与翻页解耦，是为了让插件侧的 ``bot.call_api`` 回补复用同一段逻辑
+    （容器内没有 OneBot HTTP 端点，``OneBotHistorySource`` 用不上）。
+    """
+    collected: list[HistoryMessage] = []
+    seen: set[Any] = set()
+    cursor = 0
+    while True:
+        page = await fetch_page(cursor)
+        parsed: list[HistoryMessage] = []
+        for record in page:
+            key = record.get("message_seq", record.get("message_id"))
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            parsed.append(parse_onebot_message(group_id, record))
+        if not parsed:
+            break
+
+        collected = parsed + collected
+        oldest = min(parsed, key=lambda message: message.sent_at)
+        if since is not None and oldest.sent_at <= since:
+            break
+        if limit is not None and len(collected) >= limit:
+            break
+        sequences = [
+            message.message_seq for message in parsed if message.message_seq is not None
+        ]
+        next_cursor = (min(sequences) - 1) if sequences else 0
+        if next_cursor <= 0:
+            break
+        cursor = next_cursor
+
+    return _apply_since_and_limit(_sort_by_time(collected), since=since, limit=limit)
 
 
 def render_message_segments(segments: Sequence[Any]) -> str:
@@ -396,6 +468,15 @@ def _extract_messages(data: dict[str, Any]) -> list[dict[str, Any]] | None:
     return None
 
 
+def extract_history_messages(data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """从历史响应里取出消息列表，兼容顶层 ``messages`` 与 ``data.messages``。
+
+    插件侧 ``bot.call_api("get_group_msg_history")`` 拿到的是已解包的 ``data``，形状与
+    HTTP 响应不完全一致，靠这个公开入口统一。
+    """
+    return _extract_messages(data)
+
+
 def _sort_by_time(messages: Sequence[HistoryMessage]) -> list[HistoryMessage]:
     return sorted(messages, key=lambda message: message.sent_at)
 
@@ -422,6 +503,10 @@ __all__ = [
     "HistorySource",
     "OneBotHistorySource",
     "SampleHistorySource",
+    "extract_history_messages",
+    "fetch_onebot_history",
     "message_dedupe_hash",
+    "parse_onebot_message",
     "render_message_segments",
+    "resolve_backfill_since",
 ]

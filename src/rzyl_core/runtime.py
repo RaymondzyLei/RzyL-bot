@@ -13,16 +13,20 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
     report = await runtime.replay(source=SampleHistorySource("history.json"), group_id=...)
     await runtime.stop()
 
-内部后台任务的现状（工单 #5 明确要写明，避免"以为实现了"）：
+内部后台任务的现状（工单 #5 与里程碑 2 明确要写明，避免"以为实现了"）：
 
 - **保留期清理**（``cleanup_retention``）：**已实现**。按 ``settings.retention_days``
   删掉 ``sent_at`` 早于截止时刻的原文；只删原文，记忆条目永久。
 - **向量补算**（``backfill_embeddings``）：**已实现**。取向量为空的活条目，批量算向量
   并写回；向量服务不可用（返回 ``None`` 或抛异常）时本轮什么都不做，条目照常保留。
-- 两个后台循环（``_retention_loop`` / ``_embedding_loop``）只是按固定间隔调用上面两个
-  方法；间隔是模块常量，将来接实时链路时再挪进设置。
-- **尚未实现**：窗口超时刷新与死信重试的常驻循环属于里程碑 2 的实时链路，这里只提供
-  ``flush_expired`` / ``flush_group`` 两个手动入口给回放与测试用。
+- **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠
+  ``_window_flush_loop`` 周期把未满的缓冲按时成窗并入库；间隔取
+  ``settings.window_flush_seconds``。
+- **死信重试**（``retry_dead_windows``）：**已实现**。``_dead_letter_loop`` 周期找出
+  状态为 ``dead`` 的窗口重跑；护栏与可观察性见 :meth:`Runtime.retry_dead_windows` 的
+  文档字符串。间隔取 ``settings.dead_letter_retry_seconds``。
+- 保留期清理与向量补算两个老循环的间隔仍是模块常量（``RETENTION_SWEEP_SECONDS`` /
+  ``EMBEDDING_SWEEP_SECONDS``）；新增的两个循环按里程碑 2 的要求从设置读。
 
 回放有两个模式，差别只在**写与不写**：
 
@@ -45,10 +49,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from rzyl_core.db import Message, Repository
+from rzyl_core.db import Message, Repository, Window, WindowStatus
 from rzyl_core.llm import ChatModel, EmbeddingModel, embed_batch
+from rzyl_core.pipeline.collector import collect, merge_allowed_groups
 from rzyl_core.pipeline.extract import ExtractionOutcome, ExtractionPipeline, PreviewOutcome
 from rzyl_core.pipeline.history import HistorySource, HistoryMessage, message_dedupe_hash
 from rzyl_core.pipeline.window import (
@@ -56,6 +61,8 @@ from rzyl_core.pipeline.window import (
     DEFAULT_REMEMBERED_LIMIT,
     AssembledWindow,
     WindowAssembler,
+    WindowMessage,
+    assemble_window,
 )
 from rzyl_core.settings import Settings
 from rzyl_core.timeutil import utcnow
@@ -70,6 +77,9 @@ EMBEDDING_SWEEP_SECONDS = 300
 
 #: 一次向量补算最多处理多少条，避免一次拉太多进内存。
 EMBEDDING_BACKFILL_BATCH = 100
+
+#: 死信重试循环一轮最多处理多少个死信窗口，避免一次拉太多进内存。
+DEAD_LETTER_RETRY_BATCH = 20
 
 #: 向量调用写进 ``llm_call.purpose`` 的用途标签。
 EMBED_PURPOSE = "embed"
@@ -214,6 +224,8 @@ class Runtime:
             self._tasks = [
                 asyncio.create_task(self._retention_loop(), name="rzyl-retention-sweep"),
                 asyncio.create_task(self._embedding_loop(), name="rzyl-embedding-backfill"),
+                asyncio.create_task(self._window_flush_loop(), name="rzyl-window-flush"),
+                asyncio.create_task(self._dead_letter_loop(), name="rzyl-dead-letter-retry"),
             ]
 
     async def stop(self) -> None:
@@ -273,6 +285,55 @@ class Runtime:
             message=message,
             outcomes=tuple(outcomes),
             buffered=assembler.buffered_count(group_id),
+        )
+
+    async def allowed_groups(self) -> frozenset[int]:
+        """当前允许采集的群号：设置里的白名单 **并上** 数据库里的每群运行开关。
+
+        两个来源缺一不可——配置文件给初始值，里程碑 3 的开关命令写数据库；这里取并集，
+        判定与插件启动日志都用它。
+        """
+        repository = self._require_repository()
+        return merge_allowed_groups(
+            self._settings.group_whitelist, await repository.enabled_groups()
+        )
+
+    async def ingest_message(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        self_id: int | None,
+        segments: Sequence[Any],
+        sent_at: datetime,
+        nickname: str | None = None,
+        card: str | None = None,
+        platform_message_id: int | None = None,
+    ) -> IngestResult | None:
+        """采集一条 OB11 群消息：判定 → 文本化 → 落库进窗；不该收时返回 ``None``。
+
+        判定、文本化、入库全在 core（见 :mod:`rzyl_core.pipeline.collector`），插件只把
+        事件的几样字段塞进来。``segments`` 是 OB11 消息段数组（``{"type": ..., "data": ...}``
+        的列表），``self_id`` 是机器人自己的 QQ 号（用来跳过自己发的消息）。
+        """
+        rendered = collect(
+            group_id=group_id,
+            user_id=user_id,
+            self_id=self_id,
+            segments=segments,
+            allowed_groups=await self.allowed_groups(),
+        )
+        if rendered is None:
+            return None
+        return await self.ingest(
+            group_id=group_id,
+            user_id=user_id,
+            text=rendered.text,
+            sent_at=sent_at,
+            nickname=nickname,
+            card=card,
+            segments_json=rendered.segments_json,
+            platform_message_id=platform_message_id,
         )
 
     async def flush_group(self, group_id: int) -> tuple[ExtractionOutcome, ...]:
@@ -373,6 +434,119 @@ class Runtime:
                 raise
             except Exception:
                 logger.exception("向量补算失败，下一轮再试")
+
+    # —— 后台任务：窗口超时刷新（里程碑 2）——
+
+    async def _window_flush_loop(self) -> None:
+        """按 ``settings.window_flush_seconds`` 周期调 ``flush_expired()``；单轮失败不退循环。
+
+        群里没人说话时，未满的缓冲靠这个循环按时成窗——否则消息会一直卡在内存里，
+        直到下一条消息到来或进程重启（重启就丢，只能靠回补兜底）。
+        """
+        while True:
+            await asyncio.sleep(self._settings.window_flush_seconds)
+            try:
+                outcomes = await self.flush_expired()
+                if outcomes:
+                    logger.info("窗口超时刷新关闭了 %d 个窗口", len(outcomes))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("窗口超时刷新失败，下一轮再试")
+
+    # —— 后台任务：死信重试（里程碑 2）——
+
+    async def retry_dead_windows(self, *, limit: int = DEAD_LETTER_RETRY_BATCH) -> int:
+        """重试状态为 ``dead`` 的窗口，返回本轮真正重试（或判定放弃）的窗口数。
+
+        **护栏（这是重试策略的完整说明）**：只有 ``retry_count < dead_letter_max_retries``
+        的窗口才重试；每被后台重试一次，``retry_count`` 加一。首次失败时提取管道已把
+        ``retry_count`` 记为尝试次数，所以默认 ``extract_max_attempts=3`` 配
+        ``dead_letter_max_retries=5`` 大致是「首次失败后再重试两轮」，到顶就不再碰它——
+        避免同一个窗口被无限重试。窗口按编号升序处理，老死信不排队。
+
+        重试需要把 ``window`` 行还原成一段消息再重新组装（``evidence`` 的序号要换回真实
+        编号）。若原文已被保留期清掉、还原不出任何消息，就把 ``retry_count`` 直接推到上限
+        并记一条告警，避免每轮都白跑一次。可观察性：每次重试结果都写日志，``retry_count``
+        与 ``error`` 落在窗口行上，仓储可读。
+        """
+        repository = self._require_repository()
+        pipeline = self._require_pipeline()
+        max_retries = self._settings.dead_letter_max_retries
+        windows = await repository.list_windows_by_status(WindowStatus.DEAD, limit=limit)
+        touched = 0
+        for window in windows:
+            window_id = int(window.id)
+            base = int(window.retry_count or 0)
+            if base >= max_retries:
+                continue
+            assembled = await self._rebuild_window(repository, window)
+            if assembled is None:
+                await repository.update_window_status(
+                    window_id,
+                    WindowStatus.DEAD,
+                    retry_count=max_retries,
+                    error="原文已被保留期清理，无法重建窗口",
+                )
+                logger.warning(
+                    "死信窗口 %s（群 %s）的原文已不在，放弃重试", window_id, window.group_id
+                )
+                touched += 1
+                continue
+            outcome = await pipeline.process_window(assembled, window_id=window_id)
+            if outcome.status is WindowStatus.DEAD:
+                await repository.update_window_status(
+                    window_id, WindowStatus.DEAD, retry_count=base + 1, error=outcome.error
+                )
+                logger.warning(
+                    "死信窗口 %s 第 %d 次重试仍失败：%s", window_id, base + 1, outcome.error
+                )
+            else:
+                logger.info("死信窗口 %s 重试后状态变为 %s", window_id, outcome.status.value)
+            touched += 1
+        return touched
+
+    async def _rebuild_window(
+        self, repository: Repository, window: Window
+    ) -> AssembledWindow | None:
+        """把一条 ``window`` 行按起止时间还原成可重跑的 :class:`AssembledWindow`。
+
+        取该群 ``started_at`` 与 ``ended_at``（含两端）之间的原文；找不到（原文被保留期
+        清掉）或窗口没记时间时返回 ``None``。超出 ``message_count`` 的部分砍掉，保证还原
+        出的窗口与当初处理的那一段一致。
+        """
+        started_at = window.started_at
+        ended_at = window.ended_at
+        if started_at is None or ended_at is None:
+            return None
+        stored = await repository.list_messages_between(
+            group_id=int(window.group_id),
+            since=started_at,
+            until=ended_at,
+            limit=max(int(window.message_count or 0) + 5, 50),
+        )
+        count = int(window.message_count or 0)
+        messages = [WindowMessage.from_message(message) for message in stored]
+        if count:
+            messages = messages[:count]
+        if not messages:
+            return None
+        return assemble_window(
+            group_id=int(window.group_id),
+            messages=messages,
+            prompt_version=window.prompt_version,
+        )
+
+    async def _dead_letter_loop(self) -> None:
+        """按 ``settings.dead_letter_retry_seconds`` 周期跑死信重试；单轮失败不退循环。"""
+        while True:
+            await asyncio.sleep(self._settings.dead_letter_retry_seconds)
+            try:
+                await self.retry_dead_windows()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("死信重试失败，下一轮再试")
 
     # —— 离线回放 ——
 
@@ -522,6 +696,7 @@ class Runtime:
 
 
 __all__ = [
+    "DEAD_LETTER_RETRY_BATCH",
     "EMBEDDING_BACKFILL_BATCH",
     "EMBEDDING_SWEEP_SECONDS",
     "EMBED_PURPOSE",
@@ -529,4 +704,37 @@ __all__ = [
     "IngestResult",
     "ReplayReport",
     "Runtime",
+    "get_runtime",
+    "get_runtime_or_none",
+    "set_runtime",
 ]
+
+
+# —— 模块级 Runtime 注册表：插件取得 Runtime 的显式方式 ——
+#
+# NoneBot 插件与 core 之间不能互相隐式依赖，也不该往 driver 上乱挂属性。装配层
+# （``bot.py``）构造好 Runtime 后 ``set_runtime(runtime)``，插件用 ``get_runtime()`` 取；
+# 记忆功能因缺少密钥未启用时装配层 ``set_runtime(None)``，插件用
+# ``get_runtime_or_none()`` 判空后静默跳过，机器人照常收发消息。
+
+_runtime: Runtime | None = None
+
+
+def set_runtime(runtime: Runtime | None) -> None:
+    """注册（或清空）进程内唯一的 Runtime；由装配层调用。"""
+    global _runtime
+    _runtime = runtime
+
+
+def get_runtime_or_none() -> Runtime | None:
+    """取已注册的 Runtime；未装配或记忆功能未启用时返回 ``None``。"""
+    return _runtime
+
+
+def get_runtime() -> Runtime:
+    """取已注册的 Runtime；未装配时抛 ``RuntimeError``，明确告知而不是给个空壳。"""
+    if _runtime is None:
+        raise RuntimeError(
+            "Runtime 尚未装配：bot.py 未调用 set_runtime()，或记忆功能因缺少聊天模型密钥未启用"
+        )
+    return _runtime

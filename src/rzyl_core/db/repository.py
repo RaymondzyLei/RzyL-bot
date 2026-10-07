@@ -166,6 +166,28 @@ class Repository:
         async with self._sessions() as session:
             return await session.get(Window, window_id)
 
+    # —— 按状态列举窗口（以下为里程碑 2 追加）——
+
+    async def list_windows_by_status(
+        self,
+        status: WindowStatus,
+        *,
+        limit: int = 100,
+        group_id: int | None = None,
+    ) -> list[Window]:
+        """取指定状态的窗口，**编号升序**（最老的先处理），可选按群过滤。
+
+        死信重试（``Runtime.retry_dead_windows``）据此取 ``status=dead`` 的窗口；
+        编号升序保证老死信不会被新死信一直插队。
+        """
+        statement = select(Window).where(Window.status == status)
+        if group_id is not None:
+            statement = statement.where(Window.group_id == group_id)
+        statement = statement.order_by(Window.id).limit(limit)
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
     # —— 记忆条目 ——
 
     async def add_memory(
@@ -489,6 +511,56 @@ class Repository:
         async with self._sessions() as session:
             result = await session.execute(statement)
             return list(result.scalars().all())
+
+    async def list_messages_between(
+        self,
+        *,
+        group_id: int,
+        since: datetime,
+        until: datetime,
+        limit: int = 200,
+    ) -> list[Message]:
+        """取某群 ``since`` 与 ``until``（含两端）之间的原文，按发送时间升序。
+
+        死信重试要靠它把 ``window`` 行还原回一段消息、重新组装窗口（序号→真实编号的
+        映射必须对得上）。
+        """
+        statement = (
+            select(Message)
+            .where(Message.group_id == group_id)
+            .where(Message.sent_at >= since)
+            .where(Message.sent_at <= until)
+            .order_by(Message.sent_at, Message.id)
+            .limit(limit)
+        )
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return list(result.scalars().all())
+
+    async def latest_message_sent_at(self, group_id: int) -> datetime | None:
+        """某群**已存消息里最新一条**的发送时间；一条都没有时返回 ``None``。
+
+        掉线回补的锚点（见 issue #1「以该群最后一条已处理消息的时间戳为锚」）——
+        平台短 ID 是内存映射、重启即失效，只能靠时间戳。
+        """
+        statement = select(func.max(Message.sent_at)).where(Message.group_id == group_id)
+        async with self._sessions() as session:
+            value = (await session.execute(statement)).scalar()
+        return value if isinstance(value, datetime) else None
+
+    async def existing_message_hashes(self, hashes: Sequence[str]) -> set[str]:
+        """在给定的一批消息去重 hash 里，返回**库中已存在**的那些。
+
+        掉线回补据此跳过已经存过的消息（内容 hash = 群号 + 发送者 + 时间 + 文本，
+        见 ``pipeline.history.message_dedupe_hash``），避免重启回补把同一条记两遍。
+        """
+        cleaned = [value for value in hashes if value]
+        if not cleaned:
+            return set()
+        statement = select(Message.dedupe_hash).where(Message.dedupe_hash.in_(cleaned))
+        async with self._sessions() as session:
+            result = await session.execute(statement)
+            return set(result.scalars().all())
 
     async def delete_messages_before(self, cutoff: datetime) -> int:
         """删掉 ``sent_at`` 严格早于 ``cutoff`` 的原文消息，返回删除条数。

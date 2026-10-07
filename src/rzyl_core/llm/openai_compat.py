@@ -15,7 +15,7 @@ DeepSeek 官方没有 embedding 接口，所以聊天与向量是两组彼此独
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import TracebackType
 from typing import Any, Self
 
@@ -156,7 +156,13 @@ def _parse_json_object(response: httpx.Response, operation: str) -> dict[str, An
 
 
 class OpenAICompatChatClient(_OpenAICompatClientBase):
-    """OpenAI 兼容的聊天补全客户端，POST ``{base_url}/chat/completions``。"""
+    """OpenAI 兼容的聊天补全客户端，POST ``{base_url}/chat/completions``。
+
+    ``extra_body`` 里的字段会**原样合并**进请求 JSON（同名键以它为准），让模型怪癖
+    不必改代码：例如硅基流动的 ``Qwen/Qwen3.5-4B`` 默认进思考模式会挂死请求，配置
+    ``{"enable_thinking": false}`` 即可。默认 ``None``，此时请求体只有 ``model`` 与
+    ``messages`` 两项，不掺任何服务商专有参数。
+    """
 
     def __init__(
         self,
@@ -168,6 +174,7 @@ class OpenAICompatChatClient(_OpenAICompatClientBase):
         max_retries: int = 3,
         max_concurrency: int = 4,
         backoff_base: float = 0.5,
+        extra_body: Mapping[str, Any] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         super().__init__(
@@ -180,6 +187,12 @@ class OpenAICompatChatClient(_OpenAICompatClientBase):
             backoff_base=backoff_base,
             transport=transport,
         )
+        self._extra_body = dict(extra_body) if extra_body else {}
+
+    @property
+    def extra_body(self) -> dict[str, Any]:
+        """当前配置的额外请求体字段（副本，改它不影响客户端）。"""
+        return dict(self._extra_body)
 
     async def complete(self, system: str, user: str) -> ChatResult:
         payload: dict[str, Any] = {
@@ -189,6 +202,8 @@ class OpenAICompatChatClient(_OpenAICompatClientBase):
                 {"role": "user", "content": user},
             ],
         }
+        if self._extra_body:
+            payload.update(self._extra_body)
         data = await self._request_json("chat/completions", payload, operation="聊天补全")
 
         choices = data.get("choices")

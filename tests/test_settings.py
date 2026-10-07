@@ -4,6 +4,9 @@ seam 是 ``Settings`` 的公开构造：所有可调项都有默认值，能从�
 密钥留空时对象仍能构造成功（构造过程不联网、不读盘上的密钥）。
 """
 
+import pytest
+from pydantic import ValidationError
+
 from rzyl_core.settings import Settings
 
 
@@ -79,3 +82,52 @@ def test_pricing_is_configurable_for_cost_estimation(monkeypatch) -> None:
 
     assert settings.chat_input_price == 1.5
     assert settings.chat_output_price == 3.0
+
+
+# —— 里程碑 2：实时链路的可调项 ——
+
+
+def test_realtime_loop_and_backfill_defaults_are_configured() -> None:
+    settings = _load_settings()
+
+    # 三个后台循环的间隔都可配，都有合理默认。
+    assert settings.window_flush_seconds > 0
+    assert settings.dead_letter_retry_seconds > 0
+    assert settings.dead_letter_max_retries > 0
+    # 掉线回补的两条护栏：至多 24 小时或至多 N 条。
+    assert settings.backfill_max_hours == 24
+    assert settings.backfill_max_messages > 0
+
+
+def test_chat_timeout_default_is_generous_enough_for_slow_models() -> None:
+    # 实测 Qwen3.5-4B 单次可到 50 秒以上，默认 30 秒会直接把请求打死。
+    assert _load_settings().chat_timeout >= 60
+
+
+def test_chat_extra_body_defaults_to_empty() -> None:
+    assert _load_settings().chat_extra_body == {}
+
+
+def test_chat_extra_body_parses_a_json_object(monkeypatch) -> None:
+    monkeypatch.setenv("RZYL_CHAT_EXTRA_BODY", '{"enable_thinking": false}')
+
+    assert _load_settings().chat_extra_body == {"enable_thinking": False}
+
+
+def test_chat_extra_body_rejects_a_non_object(monkeypatch) -> None:
+    monkeypatch.setenv("RZYL_CHAT_EXTRA_BODY", "[1, 2]")
+
+    with pytest.raises(ValidationError):
+        _load_settings()
+
+
+def test_loop_intervals_read_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("RZYL_WINDOW_FLUSH_SECONDS", "15")
+    monkeypatch.setenv("RZYL_DEAD_LETTER_RETRY_SECONDS", "45")
+    monkeypatch.setenv("RZYL_CHAT_TIMEOUT", "90")
+
+    settings = _load_settings()
+
+    assert settings.window_flush_seconds == 15
+    assert settings.dead_letter_retry_seconds == 45
+    assert settings.chat_timeout == 90.0

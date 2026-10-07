@@ -13,8 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from rzyl_core.db import Category, Repository
-from rzyl_core.llm import ChatModel, DeterministicEmbedding, EmbeddingModel, NullEmbedding
+from rzyl_core.db import Category, Repository, WindowStatus
+from rzyl_core.llm import (
+    ChatModel,
+    ChatResult,
+    ChatUsage,
+    DeterministicEmbedding,
+    EmbeddingModel,
+    FakeChatModel,
+    NullEmbedding,
+)
 from rzyl_core.llm.fakes import EchoChatModel
 from rzyl_core.pipeline import assemble_window
 from rzyl_core.pipeline.window import WindowMessage
@@ -93,7 +101,8 @@ async def test_runtime_background_task_skeletons_are_started_and_cancelled(
     runtime = _runtime(tmp_path, clock)
 
     await runtime.start(run_background_tasks=True)
-    assert len(runtime.background_tasks) == 2
+    # 四个常驻循环：保留期清理、向量补算、窗口超时刷新、死信重试。
+    assert len(runtime.background_tasks) == 4
     assert all(not task.done() for task in runtime.background_tasks)
 
     await runtime.stop()
@@ -347,3 +356,230 @@ async def test_echo_chat_model_returns_one_valid_entry_for_the_first_message() -
     assert items[0].statement == "实验课改到周五下午三点"
     assert items[0].person_refs[0].user_id == 10001
     assert items[0].person_refs[0].nickname_snapshot == "小A"
+
+
+# —— 实时链路：采集判定 + 文本化 + 入库（里程碑 2）——
+
+
+def _segments(*parts: dict[str, object]) -> list[dict[str, object]]:
+    return list(parts)
+
+
+async def test_ingest_message_collects_renders_and_stores_an_allowed_group_message(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    runtime = _runtime(tmp_path, clock, window_message_limit=1, group_whitelist=[GROUP])
+    await runtime.start(run_background_tasks=False)
+    try:
+        result = await runtime.ingest_message(
+            group_id=GROUP,
+            user_id=USER,
+            self_id=999,
+            segments=_segments(
+                {"type": "text", "data": {"text": "看这张图"}},
+                {"type": "image", "data": {"url": "http://cdn/x.png", "file": "x.png"}},
+            ),
+            sent_at=BEGIN,
+            nickname="小A",
+            platform_message_id=900001,
+        )
+
+        assert result is not None
+        assert result.message.text == "看这张图[图片]"
+        # 图片的 url / file 进了 segments_json，里程碑 4 的落盘要用。
+        assert "http://cdn/x.png" in result.message.segments_json
+        assert len(result.outcomes) == 1
+    finally:
+        await runtime.stop()
+
+
+async def test_ingest_message_skips_groups_outside_the_whitelist(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    runtime = _runtime(tmp_path, clock, group_whitelist=[GROUP])
+    await runtime.start(run_background_tasks=False)
+    try:
+        result = await runtime.ingest_message(
+            group_id=999,
+            user_id=USER,
+            self_id=999,
+            segments=_segments({"type": "text", "data": {"text": "不该收"}}),
+            sent_at=BEGIN,
+        )
+
+        assert result is None
+        assert await runtime.repository.list_messages() == []
+    finally:
+        await runtime.stop()
+
+
+async def test_ingest_message_accepts_a_group_enabled_only_at_runtime(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    # 配置白名单为空，运行时开关把群开了——判定取两个来源的并集。
+    runtime = _runtime(tmp_path, clock)
+    await runtime.start(run_background_tasks=False)
+    try:
+        await runtime.repository.set_group_enabled(GROUP, True)
+
+        assert await runtime.allowed_groups() == frozenset({GROUP})
+        result = await runtime.ingest_message(
+            group_id=GROUP,
+            user_id=USER,
+            self_id=999,
+            segments=_segments({"type": "text", "data": {"text": "运行时开的群"}}),
+            sent_at=BEGIN,
+        )
+
+        assert result is not None
+    finally:
+        await runtime.stop()
+
+
+async def test_ingest_message_skips_the_bot_own_messages(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    runtime = _runtime(tmp_path, clock, group_whitelist=[GROUP])
+    await runtime.start(run_background_tasks=False)
+    try:
+        result = await runtime.ingest_message(
+            group_id=GROUP,
+            user_id=USER,
+            self_id=USER,
+            segments=_segments({"type": "text", "data": {"text": "我自己发的"}}),
+            sent_at=BEGIN,
+        )
+
+        assert result is None
+    finally:
+        await runtime.stop()
+
+
+# —— 后台任务：死信重试（里程碑 2）——
+
+
+def _chat_json(text: str) -> ChatResult:
+    return ChatResult(text=text, usage=ChatUsage(input_tokens=1, output_tokens=1), model="scripted")
+
+
+async def test_dead_letter_retry_reprocesses_a_dead_window_to_done(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    chat = FakeChatModel(
+        [
+            _chat_json("这不是 JSON"),  # 首次尝试 1 失败
+            _chat_json("这不是 JSON"),  # 首次尝试 2 失败 → 整窗进死信
+            _chat_json("[]"),  # 后台重试这一次成功
+        ]
+    )
+    runtime = _runtime(
+        tmp_path,
+        clock,
+        chat_model=chat,
+        window_message_limit=1,
+        extract_max_attempts=2,
+        dead_letter_max_retries=4,
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        ingested = await runtime.ingest(group_id=GROUP, user_id=USER, text="会失败", sent_at=BEGIN)
+        timeline_window_id = ingested.outcomes[0].window_id
+        assert ingested.outcomes[0].status is WindowStatus.DEAD
+
+        retried = await runtime.retry_dead_windows()
+
+        assert retried == 1
+        window = await runtime.repository.get_window(timeline_window_id)
+        assert window is not None
+        assert window.status is WindowStatus.DONE
+    finally:
+        await runtime.stop()
+
+
+async def test_dead_letter_retry_stops_at_the_configured_guard(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    runtime = _runtime(
+        tmp_path,
+        clock,
+        chat_model=FakeChatModel([_chat_json("坏") for _ in range(10)]),
+        window_message_limit=1,
+        extract_max_attempts=2,
+        dead_letter_max_retries=2,
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        ingested = await runtime.ingest(group_id=GROUP, user_id=USER, text="必死", sent_at=BEGIN)
+        window_id = ingested.outcomes[0].window_id
+
+        # retry_count 已达护栏（2 不小于 2），后台不再重试，也不再消耗模型脚本。
+        assert await runtime.retry_dead_windows() == 0
+        window = await runtime.repository.get_window(window_id)
+        assert window is not None
+        assert window.status is WindowStatus.DEAD
+    finally:
+        await runtime.stop()
+
+
+async def test_dead_letter_retry_gives_up_when_the_source_messages_are_gone(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    runtime = _runtime(
+        tmp_path,
+        clock,
+        chat_model=FakeChatModel([_chat_json("坏") for _ in range(4)]),
+        window_message_limit=1,
+        extract_max_attempts=2,
+        dead_letter_max_retries=4,
+    )
+    await runtime.start(run_background_tasks=False)
+    try:
+        ingested = await runtime.ingest(group_id=GROUP, user_id=USER, text="必死", sent_at=BEGIN)
+        window_id = ingested.outcomes[0].window_id
+
+        # 原文被保留期清掉后无法重建窗口：这一轮判它放弃（计入返回值），并把重试次数推到
+        # 上限，避免每轮都白跑一次。
+        await runtime.repository.delete_messages_before(BEGIN + timedelta(seconds=1))
+        assert await runtime.retry_dead_windows() == 1
+
+        window = await runtime.repository.get_window(window_id)
+        assert window is not None
+        assert window.status is WindowStatus.DEAD
+        assert window.retry_count >= 4
+
+        # 已被推到上限，下一轮不再进入重试集合。
+        assert await runtime.retry_dead_windows() == 0
+    finally:
+        await runtime.stop()
+
+
+async def test_window_flush_loop_body_closes_a_quiet_window(tmp_path: Path, clock: _Clock) -> None:
+    """窗口超时刷新的循环体就是 ``flush_expired``；这里验证它按注入时钟正确收尾。"""
+    runtime = _runtime(tmp_path, clock, window_message_limit=30, window_flush_seconds=1)
+    await runtime.start(run_background_tasks=False)
+    try:
+        await runtime.ingest(group_id=GROUP, user_id=USER, text="安静了", sent_at=BEGIN)
+        assert await runtime.flush_expired() == ()
+
+        clock.advance(6)
+        outcomes = await runtime.flush_expired()
+
+        assert len(outcomes) == 1
+        assert outcomes[0].status is WindowStatus.DONE
+    finally:
+        await runtime.stop()
+
+
+# —— 模块级 Runtime 注册表（插件取 Runtime 的显式方式）——
+
+
+def test_module_level_runtime_registry_raises_until_configured() -> None:
+    from rzyl_core.runtime import get_runtime, get_runtime_or_none, set_runtime
+
+    set_runtime(None)
+    try:
+        assert get_runtime_or_none() is None
+        with pytest.raises(RuntimeError):
+            get_runtime()
+    finally:
+        set_runtime(None)

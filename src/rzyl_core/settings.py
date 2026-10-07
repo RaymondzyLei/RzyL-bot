@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -65,6 +65,31 @@ class Settings(BaseSettings):
     group_whitelist: Annotated[list[int], NoDecode] = []
     """初始监听的群号；默认空列表，表示一个群都不监听。"""
 
+    # —— 实时链路的后台循环（里程碑 2）——
+    window_flush_seconds: int = 60
+    """窗口超时刷新循环的间隔（秒）：群里没人说话时，靠它把未满的缓冲按时成窗。"""
+
+    dead_letter_retry_seconds: int = 300
+    """死信重试循环的间隔（秒）。"""
+
+    dead_letter_max_retries: int = 5
+    """死信窗口被后台重试到 ``retry_count`` 达到该值就放弃。
+
+    ``retry_count`` 由首次失败时的尝试次数起算，之后每被后台重试一次加一：默认
+    ``extract_max_attempts=3`` 配 ``dead_letter_max_retries=5`` 大致是「首次失败后
+    再重试两轮」。达到上限就**不再重试**（窗口仍是 ``dead``），避免无限重试同一个窗口。
+    """
+
+    # —— 掉线回补（里程碑 2）——
+    backfill_max_hours: int = 24
+    """回补的时间护栏：至多回补最近这么多小时，更早的放弃并记一条告警。"""
+
+    backfill_max_messages: int = 500
+    """回补的条数护栏：单个群一次最多回补这么多条，达到上限记一条告警。"""
+
+    backfill_page_size: int = 20
+    """回补时 ``get_group_msg_history`` 每页的条数。"""
+
     # —— 存储 ——
     database_url: str = "sqlite+aiosqlite:///data/rzyl.db"
     """SQLite 连接串。默认落在宿主机的 ``data/`` 目录，便于备份与手工查询。"""
@@ -83,6 +108,16 @@ class Settings(BaseSettings):
     chat_base_url: str = "https://api.deepseek.com/v1"
     chat_model: str = "deepseek-chat"
     chat_api_key: str = ""
+    chat_timeout: float = 120.0
+    """单次聊天请求的超时（秒）。给足：实测 Qwen3.5-4B 这类模型单次可到 50 秒以上。"""
+    chat_extra_body: Annotated[dict[str, Any], NoDecode] = {}
+    """原样合并进聊天请求 JSON 的额外字段（JSON 对象）。
+
+    用途是让**模型怪癖不必改代码**：例如硅基流动的 ``Qwen/Qwen3.5-4B`` 默认进思考模式
+    会把请求挂死，必须带 ``{"enable_thinking": false}`` 才正常返回，配置写成
+    ``RZYL_CHAT_EXTRA_BODY={"enable_thinking": false}`` 即可。默认空对象，不代表任何
+    服务商专有参数。
+    """
     chat_input_price: float = 0.0
     """每百万输入 token 的单价，用于记账估费；未配置按 0 估算。"""
     chat_output_price: float = 0.0
@@ -107,6 +142,20 @@ class Settings(BaseSettings):
             if text.startswith("["):
                 return json.loads(text)
             return [int(item.strip()) for item in text.split(",") if item.strip()]
+        return value
+
+    @field_validator("chat_extra_body", mode="before")
+    @classmethod
+    def _parse_chat_extra_body(cls, value: object) -> object:
+        """接受 JSON 对象字符串；空串视为空对象。非对象一律报错，不静默丢弃。"""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("RZYL_CHAT_EXTRA_BODY 必须是 JSON 对象")
+            return parsed
         return value
 
     def estimate_chat_cost(self, tokens_in: int, tokens_out: int) -> float:

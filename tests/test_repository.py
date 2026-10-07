@@ -419,3 +419,66 @@ async def test_llm_call_and_feedback_are_recorded(repo: Repository) -> None:
 async def test_naive_datetime_is_rejected(repo: Repository) -> None:
     with pytest.raises(ValueError):
         await repo.add_message(group_id=111, user_id=222, text="无时区", sent_at=datetime(2026, 10, 7, 9, 0))
+
+
+# —— 按状态列举窗口（里程碑 2 的死信重试要用）——
+
+
+async def test_list_windows_by_status_filters_and_orders_oldest_first(repo: Repository) -> None:
+    first = await repo.add_window(group_id=111, started_at=BEGIN, message_count=1)
+    second = await repo.add_window(group_id=222, started_at=BEGIN, message_count=1)
+    await repo.add_window(group_id=333, started_at=BEGIN, message_count=1)
+    await repo.update_window_status(first.id, WindowStatus.DEAD, retry_count=3)
+    await repo.update_window_status(second.id, WindowStatus.DEAD, retry_count=1)
+
+    dead = await repo.list_windows_by_status(WindowStatus.DEAD)
+
+    # 编号升序：最老的先重试，避免新死信一直插队。
+    assert [window.id for window in dead] == [first.id, second.id]
+    assert all(window.status is WindowStatus.DEAD for window in dead)
+
+
+async def test_list_windows_by_status_respects_limit_and_can_filter_by_group(repo: Repository) -> None:
+    for index in range(4):
+        window = await repo.add_window(group_id=111, started_at=BEGIN, message_count=1)
+        await repo.update_window_status(window.id, WindowStatus.DEAD, retry_count=index)
+
+    assert len(await repo.list_windows_by_status(WindowStatus.DEAD, limit=2)) == 2
+    assert await repo.list_windows_by_status(WindowStatus.DEAD, group_id=999) == []
+
+
+# —— 回补锚点：某群最后一条已存消息的时间 ——
+
+
+async def test_latest_message_sent_at_returns_the_newest_or_none(repo: Repository) -> None:
+    assert await repo.latest_message_sent_at(111) is None
+
+    await repo.add_message(group_id=111, user_id=1, text="早", sent_at=BEGIN - timedelta(minutes=5))
+    await repo.add_message(group_id=111, user_id=2, text="晚", sent_at=BEGIN)
+    await repo.add_message(group_id=222, user_id=3, text="别的群", sent_at=BEGIN + timedelta(days=1))
+
+    assert await repo.latest_message_sent_at(111) == BEGIN
+    assert await repo.latest_message_sent_at(222) == BEGIN + timedelta(days=1)
+
+
+async def test_list_messages_between_returns_the_window_slice(repo: Repository) -> None:
+    await repo.add_message(group_id=111, user_id=1, text="窗口前", sent_at=BEGIN - timedelta(minutes=1))
+    first = await repo.add_message(group_id=111, user_id=1, text="窗口首", sent_at=BEGIN)
+    last = await repo.add_message(group_id=111, user_id=2, text="窗口尾", sent_at=BEGIN + timedelta(minutes=1))
+    await repo.add_message(group_id=111, user_id=3, text="窗口后", sent_at=BEGIN + timedelta(minutes=2))
+
+    slice_ = await repo.list_messages_between(
+        group_id=111, since=BEGIN, until=BEGIN + timedelta(minutes=1)
+    )
+
+    assert [message.id for message in slice_] == [first.id, last.id]
+
+
+async def test_existing_message_hashes_reports_only_known_hashes(repo: Repository) -> None:
+    await repo.add_message(group_id=111, user_id=1, text="甲", sent_at=BEGIN, dedupe_hash="h1")
+    await repo.add_message(group_id=111, user_id=2, text="乙", sent_at=BEGIN, dedupe_hash="h2")
+
+    found = await repo.existing_message_hashes(["h2", "h3", ""])
+
+    assert found == {"h2"}
+    assert await repo.existing_message_hashes([]) == set()

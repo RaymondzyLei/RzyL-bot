@@ -17,6 +17,20 @@
 
 from __future__ import annotations
 
-from rzyl_core.runtime import IngestResult, ReplayReport, Runtime
+from rzyl_core.runtime import (
+    IngestResult,
+    ReplayReport,
+    Runtime,
+    get_runtime,
+    get_runtime_or_none,
+    set_runtime,
+)
 
-__all__ = ["IngestResult", "ReplayReport", "Runtime"]
+__all__ = [
+    "IngestResult",
+    "ReplayReport",
+    "Runtime",
+    "get_runtime",
+    "get_runtime_or_none",
+    "set_runtime",
+]
