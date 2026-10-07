@@ -17,6 +17,9 @@
 - **校验即失败**：JSON 坏了、字段缺失、类别不在四类、``evidence`` 越界，一律算解析失败，
   按窗口重试；重试用尽整窗进死信，绝不把半成品静默写库。
 - **空数组是正常结果**：窗口结束为 ``done``，不产生条目，也不算失败。
+- **丢了什么要看得见**：解析失败时把模型的原始输出截断后记进 ``WARNING``；若早先某次
+  尝试产出过非空内容、最终却以空数组结束，则额外告警并在窗口行 ``error`` 留一句说明
+  （状态仍是 ``done``）——只加可观测性，不改判定语义。
 - **入库不设置信度门槛**：只要归入四类之一就写库（门槛只在推送时用）。
 - **supersede 只标记不删除**：旧条目置为 ``expired`` 并让它的 ``superseded_by`` 指向新条目，
   新条目不做任何反向修改。
@@ -64,11 +67,62 @@ from rzyl_core.settings import Settings
 #: 聊天调用写进 ``llm_call.purpose`` 的用途标签。
 LLM_PURPOSE = "extract"
 
+#: 校验失败时，模型的原始输出写进 WARNING 日志前截断到这个长度（字符数）。
+#: 原始输出可能上千字，截断是为了「丢了什么看得见」而不是「把日志刷爆」。
+RAW_OUTPUT_LOG_LIMIT = 500
+
 logger = logging.getLogger(__name__)
 
 
 class ExtractionParseError(ValueError):
     """模型输出无法变成合法条目：JSON 坏了、字段缺失、evidence 越界等。"""
+
+
+def _coerce_supersede(candidate: object) -> int | None:
+    """把单个候选值变成编号；``None`` / 空串到 ``None``，其余不合法就抛 ``ValueError``。"""
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool):
+        # bool 是 int 的子类，但把它当编号是错的（True 会悄悄变成 1）。
+        raise ValueError(f"supersedes 不接受布尔值：{candidate!r}")
+    if isinstance(candidate, int):
+        return candidate
+    if isinstance(candidate, float):
+        # JSON 里的整数有时会写成 2.0；只接受整值浮点，小数一律算格式错误。
+        if candidate.is_integer():
+            return int(candidate)
+        raise ValueError(f"supersedes 不是整数编号：{candidate!r}")
+    if isinstance(candidate, str):
+        text = candidate.strip().lstrip("#").strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise ValueError(f"supersedes 不是可解析的编号：{candidate!r}") from exc
+    raise ValueError(f"supersedes 不是编号：{candidate!r}")
+
+
+def normalize_supersedes(value: object) -> int | None:
+    """把一个 ``supersedes`` 值归一化成 ``int | None``。
+
+    **只有这一个字段做归一化**，理由：提示词把「已记条目摘要」的锚点渲染成 ``[#编号]``
+    （见 :func:`~rzyl_core.pipeline.window.summarize_memories`），模型照着写 ``"#2"``、
+    或按 JSON 习惯包成 ``["#2"]`` 都是合理行为。若判成格式错误，轻则白白多花一次调用，
+    重则重试拿到空数组、整窗内容静默丢失——为一种写法差异丢一窗内容是得不偿失的。
+
+    接受：``2``、``"2"``、``"#2"``、``[2]``、``["#2"]``，以及表示「没有」的 ``null`` /
+    ``[]`` / 空串，统一成 ``int | None``。多元素数组不在提示词契约里（v2 明确要求单个
+    标量编号），取第一个可用元素：宁可少挂一条 supersede 链接，也不把整条记忆丢掉。
+    真的解析不出编号（如 ``"#abc"``）仍抛 ``ValueError``，交给上层按解析失败处理。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return _coerce_supersede(value[0])
+    return _coerce_supersede(value)
 
 
 class ExtractedPersonRef(BaseModel):
@@ -81,10 +135,15 @@ class ExtractedPersonRef(BaseModel):
 
 
 class ExtractedMemory(BaseModel):
-    """模型输出的单条记忆，字段与 ``llm/prompts/v1.*.md`` 的约定逐一对齐。
+    """模型输出的单条记忆，字段与 ``llm/prompts/v2.*.md`` 的约定逐一对齐。
 
     ``extra="forbid"``：多出来的字段视为格式错误。``detail`` / ``occurred_at`` 允许为
     ``null`` 但**必须出现**——提示词要求每条都带这两个键，缺键就是没按格式来。
+
+    ``supersedes`` 是**唯一**宽容的字段：提示词把「已记条目摘要」的锚点渲染成
+    ``[#编号]``，模型照抄 ``"#2"``、或按 JSON 习惯包成 ``["#2"]`` 是合理行为；
+    为此把整窗判成解析失败、重试又拿到空数组而静默丢光内容，得不偿失。所以这里先经
+    :func:`normalize_supersedes` 归一化成 ``int | None``，其余一律保持严格。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -96,7 +155,13 @@ class ExtractedMemory(BaseModel):
     evidence: list[int] = Field(min_length=1)
     person_refs: list[ExtractedPersonRef]
     occurred_at: str | None
-    supersedes: list[int]
+    supersedes: int | None
+
+    @field_validator("supersedes", mode="before")
+    @classmethod
+    def _normalize_supersedes(cls, value: object) -> int | None:
+        """把模型给的锚点写法归一化成 ``int | None``，见 :func:`normalize_supersedes`。"""
+        return normalize_supersedes(value)
 
     @field_validator("occurred_at")
     @classmethod
@@ -118,7 +183,9 @@ def parse_extraction(text: str) -> list[ExtractedMemory]:
     """把模型返回的文本严格解析成条目列表；任何不合格式都抛 :class:`ExtractionParseError`。
 
     只 strip 首尾空白后当 JSON 数组解析，不做代码围栏之类的宽容处理——提示词明确要求
-    只输出裸 JSON 数组，这里放过围栏只会掩盖提示词退化。
+    只输出裸 JSON 数组，这里放过围栏只会掩盖提示词退化。唯一的例外是 ``supersedes``
+    字段：它经 :func:`normalize_supersedes` 归一出 ``int | None``（见那里的理由），
+    其余字段一律严格。
     """
     try:
         payload = json.loads(text.strip())
@@ -130,6 +197,20 @@ def parse_extraction(text: str) -> list[ExtractedMemory]:
         return _EXTRACTED_LIST.validate_python(payload)
     except ValidationError as exc:
         raise ExtractionParseError(f"模型输出不符合条目格式：{exc}") from exc
+
+
+def _has_nonempty_candidates(text: str) -> bool:
+    """尽力判断一次**未通过校验**的原始输出里是否真有候选条目（非空 JSON 数组）。
+
+    只服务于可观测性：用来识别「这次尝试其实产出了内容、只是格式不对」。判不出来
+    （不是 JSON、不是数组、或本来就是空数组）就当没有，免得把纯噪声也算成「丢了内容」
+    而虚报。它**不参与**任何判定——空数组依然是正常结果。
+    """
+    try:
+        payload = json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(payload, list) and len(payload) > 0
 
 
 def normalize_statement(statement: str) -> str:
@@ -190,7 +271,9 @@ class ExtractionOutcome:
     - ``status`` 为 ``pending``：写库失败，事务已回滚，窗口保持可重试；
     - ``memory_ids`` 是本窗口**新增**条目的编号（顺序与模型输出一致），空数组时为空元组；
     - ``merged_count`` 是归一化文本 hash 撞上已有条目、被合并掉（未新增）的条数；
-    - ``suspect_count`` 是向量判为疑似重复的条数。
+    - ``suspect_count`` 是向量判为疑似重复的条数；
+    - ``error`` 是失败原因；``done`` 时也可能带一句说明（例如「本窗口可能有内容被
+      丢弃」），此时它只作可观测性提示，不代表窗口失败。
     """
 
     window_id: int
@@ -267,6 +350,8 @@ class ExtractionPipeline:
         target_window_id = window_id if window_id is not None else await self._ensure_window(window)
         attempts = 0
         last_error: str | None = None
+        #: 早先某次尝试产出过非空候选内容的次数（1 起）；只用于「内容可能被丢弃」的可观测性。
+        content_attempt: int | None = None
 
         while attempts < max(1, self._settings.extract_max_attempts):
             attempts += 1
@@ -285,7 +370,17 @@ class ExtractionPipeline:
                 items = self._resolve(window, result.text)
             except ExtractionParseError as exc:
                 last_error = str(exc)
-                # 调用成功、token 已被计费，只是输出不可用——照记 token，但标 success=False。
+                # 校验失败时把原始输出截断后记进 WARNING：丢了什么看得见，而不是只剩一句
+                # 「格式不对」。调用成功、token 已被计费，只是输出不可用——照记 token。
+                logger.warning(
+                    "窗口 %s 第 %d 次提取输出不合格式，原始输出（至多 %d 字）：%s",
+                    target_window_id,
+                    attempts,
+                    RAW_OUTPUT_LOG_LIMIT,
+                    result.text[:RAW_OUTPUT_LOG_LIMIT],
+                )
+                if content_attempt is None and _has_nonempty_candidates(result.text):
+                    content_attempt = attempts
                 await self._record_call(
                     usage=result.usage,
                     model=result.model,
@@ -303,6 +398,21 @@ class ExtractionPipeline:
                 success=True,
                 error=None,
             )
+            # 空数组本身是正常结果（判定语义不动）；但若早先某次尝试产出过非空内容，
+            # 说明这一窗可能有东西被丢掉了——只加可观测性，不改判定。
+            drop_note: str | None = None
+            if not items and content_attempt is not None:
+                drop_note = (
+                    f"第 {content_attempt} 次尝试产出过非空内容，最终却以空数组结束："
+                    "本窗口可能有内容被丢弃，建议人工复核原文"
+                )
+                logger.warning(
+                    "窗口 %s 可能有内容被丢弃：第 %d 次尝试产出过非空候选，"
+                    "最终以空数组结束（本窗口 %d 条消息）",
+                    target_window_id,
+                    content_attempt,
+                    window.message_count,
+                )
             try:
                 return await self._persist(
                     window=window,
@@ -311,6 +421,7 @@ class ExtractionPipeline:
                     model=result.model,
                     usage=result.usage,
                     attempts=attempts,
+                    error=drop_note,
                 )
             except SQLAlchemyError as exc:
                 # 事务已整体回滚：#5 可以把窗口重排一次，库不会留下半个窗口的条目。
@@ -439,7 +550,8 @@ class ExtractionPipeline:
                         for person in raw.person_refs
                     ],
                     occurred_at=self._anchor_occurred_at(raw.occurred_at),
-                    supersedes=list(raw.supersedes),
+                    # 校验层已把锚点归一化成单个编号；下游仍按列表处理（兼容多引用）。
+                    supersedes=[raw.supersedes] if raw.supersedes is not None else [],
                     dedupe_hash=dedupe_hash(raw.statement),
                 )
             )
@@ -466,8 +578,13 @@ class ExtractionPipeline:
         model: str,
         usage: ChatUsage,
         attempts: int,
+        error: str | None = None,
     ) -> ExtractionOutcome:
-        """两层去重、算向量、组装 ``Memory``，最后一个事务写库。"""
+        """两层去重、算向量、组装 ``Memory``，最后一个事务写库。
+
+        ``error`` 只在「窗口正常结束、但有一段说明要留在窗口行上」时使用（例如早先尝试
+        有内容、最终却是空数组，可能丢了东西），**不影响** ``status``——空数组仍是 ``done``。
+        """
         candidates = await self._repository.list_group_memories(
             group_id=window.group_id, include_inactive=True
         )
@@ -523,6 +640,7 @@ class ExtractionPipeline:
             supersedings=supersedings,
             status=WindowStatus.DONE,
             retry_count=max(0, attempts - 1),
+            error=error,
         )
         return ExtractionOutcome(
             window_id=window_id,
@@ -531,6 +649,7 @@ class ExtractionPipeline:
             attempts=attempts,
             merged_count=merged_count,
             suspect_count=suspect_count,
+            error=error,
         )
 
     def _is_near_duplicate(
@@ -620,6 +739,7 @@ class ExtractionPipeline:
 
 __all__ = [
     "LLM_PURPOSE",
+    "RAW_OUTPUT_LOG_LIMIT",
     "ExtractedMemory",
     "ExtractedPersonRef",
     "ExtractionOutcome",
@@ -629,5 +749,6 @@ __all__ = [
     "cosine_similarity",
     "dedupe_hash",
     "normalize_statement",
+    "normalize_supersedes",
     "parse_extraction",
 ]

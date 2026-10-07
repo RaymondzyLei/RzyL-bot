@@ -7,6 +7,7 @@ seam 是 *Runtime*：外部依赖（聊天模型、向量、时钟、数据库�
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -353,6 +354,86 @@ async def test_embedding_backfill_records_a_failed_call_without_fabricating_usag
         assert calls[0].error is not None
     finally:
         await runtime.stop()
+
+
+# —— 向量模型账本一致性（同维度换模型也查得出）——
+
+
+async def _seed_embed_call(tmp_path: Path, *, model: str, success: bool = True) -> None:
+    """在与 Runtime 同一个库文件里预置一条 embed 记账。"""
+    repo = await Repository.create(f"sqlite+aiosqlite:///{tmp_path / 'rzyl.db'}")
+    try:
+        await repo.add_llm_call(purpose="embed", model=model, success=success)
+    finally:
+        await repo.close()
+
+
+def _runtime_with_embedding_name(tmp_path: Path, clock: _Clock, name: str) -> Runtime:
+    """与 ``_runtime`` 相同，但显式指定 ``settings.embedding_model`` 这个名字。"""
+    return Runtime(
+        chat_model=EchoChatModel(),
+        embedding_model=DeterministicEmbedding(8),
+        settings=_settings(embedding_model=name),
+        clock=clock,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'rzyl.db'}",
+        provider="offline",
+    )
+
+
+async def test_a_same_dimension_model_swap_is_reported(
+    tmp_path: Path, clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """旧 bge-m3 → 新 Qwen 同为 1024 维：长度检查看不出来，只能靠账本查出。"""
+    await _seed_embed_call(tmp_path, model="BAAI/bge-m3")
+    runtime = _runtime_with_embedding_name(tmp_path, clock, "Qwen/Qwen3-Embedding-0.6B")
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.runtime"):
+        await runtime.start(run_background_tasks=False)
+        try:
+            # 同一进程内再查（后台循环每轮都会走到）也不该重复刷屏。
+            assert await runtime.check_embedding_model_ledger() == "BAAI/bge-m3"
+            assert await runtime.backfill_embeddings() == 0
+        finally:
+            await runtime.stop()
+
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0]
+    assert "BAAI/bge-m3" in message
+    assert "Qwen/Qwen3-Embedding-0.6B" in message
+    assert "reembed" in message
+
+
+async def test_the_ledger_check_is_silent_without_any_embed_records(
+    tmp_path: Path, clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """库里还没有任何 embed 记录：静默通过，不算异常。"""
+    runtime = _runtime(tmp_path, clock)
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.runtime"):
+        await runtime.start(run_background_tasks=False)
+        try:
+            assert await runtime.check_embedding_model_ledger() is None
+        finally:
+            await runtime.stop()
+
+    assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
+
+
+async def test_the_ledger_check_is_silent_when_the_model_is_unchanged(
+    tmp_path: Path, clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    runtime = _runtime(tmp_path, clock)
+    await _seed_embed_call(tmp_path, model=runtime.settings.embedding_model)
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.runtime"):
+        await runtime.start(run_background_tasks=False)
+        try:
+            assert await runtime.check_embedding_model_ledger() == runtime.settings.embedding_model
+        finally:
+            await runtime.stop()
+
+    assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
 
 
 # —— 离线假模型 ——

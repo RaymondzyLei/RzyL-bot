@@ -21,6 +21,8 @@ issue #1 定的装配原则是「core 只通过一个 Runtime 对外暴露」—
   并写回；向量服务不可用（返回 ``None`` 或抛异常）时本轮什么都不做，条目照常保留。
   另提供 ``reembed=True``：连已有向量的条目也一起按当前模型重算，供换向量模型后把旧
   向量全部刷新（后台补算循环只用默认的 ``reembed=False``，不会自动重算全部向量）。
+  启动与补算入口还会各跑一次「向量模型账本一致性」检查（同维度换模型也能查出，
+  见 :meth:`Runtime.check_embedding_model_ledger`），同一进程只提醒一次。
 - **窗口超时刷新**（``flush_expired``）：**已实现**。群里没人说话时，靠
   ``_window_flush_loop`` 周期把未满的缓冲按时成窗并入库；间隔取
   ``settings.window_flush_seconds``。
@@ -187,6 +189,9 @@ class Runtime:
         self._pipeline: ExtractionPipeline | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._started = False
+        #: 「向量模型账本一致性」检查同一进程内只做一次，免得后台循环每轮刷屏。
+        self._embedding_ledger_checked = False
+        self._embedding_ledger_model: str | None = None
 
     # —— 只读视图 ——
 
@@ -222,6 +227,9 @@ class Runtime:
         self._assembler = self._build_assembler(self._repository, self._clock)
         self._pipeline = self._build_pipeline(self._repository, self._clock)
         self._started = True
+        # 启动时核对一次向量模型账本：换过模型却没重算向量的库要尽早出声，而不是等到
+        # 去重结果开始离谱。同一进程只提醒一次，后台循环不会重复刷屏。
+        await self.check_embedding_model_ledger()
         if run_background_tasks:
             self._tasks = [
                 asyncio.create_task(self._retention_loop(), name="rzyl-retention-sweep"),
@@ -378,6 +386,36 @@ class Runtime:
 
     # —— 后台任务：向量补算 ——
 
+    async def check_embedding_model_ledger(self) -> str | None:
+        """核对「向量模型账本」：库里最近一次成功 ``embed`` 用的模型 vs 当前配置。
+
+        **为什么需要它**：维度守卫只挡得住维度变化。同维度的两个不同向量模型（例如
+        SiliconFlow 上 ``BAAI/bge-m3`` 与 ``Qwen/Qwen3-Embedding-0.6B`` 都是 1024 维）
+        混在一张表里，长度一模一样、余弦相似度照样算得出数，但两个向量空间不可比——
+        去重会既漏报又**误报**（把真记忆判成疑似重复，而疑似重复按设计不进推送）。
+        这类不一致从任何长度检查里都看不出来，只能靠 ``llm_call`` 里的模型名记账发现。
+
+        返回账本里记录的旧模型名（库里一条成功的 ``embed`` 记录都没有时返回 ``None``）。
+        不一致时记一条 ``WARNING`` 明确指明旧模型、新模型与补救动作（``reembed=True``）。
+        **同一 Runtime 实例内只检查与提醒一次**，后台循环每轮调用也不会刷屏；
+        ``start()`` 与 :meth:`backfill_embeddings` 入口都会走到这里，故可复用。
+        """
+        if self._embedding_ledger_checked:
+            return self._embedding_ledger_model
+        self._embedding_ledger_checked = True
+        repository = self._require_repository()
+        recorded = await repository.latest_successful_llm_call_model(purpose=EMBED_PURPOSE)
+        self._embedding_ledger_model = recorded
+        current = self._settings.embedding_model
+        if recorded is not None and recorded != current:
+            logger.warning(
+                "向量模型已变（旧 %s → 新 %s）：请跑 backfill_embeddings(reembed=True) "
+                "重算全部向量，否则新旧向量的相似度不可比、去重会既漏报又误报",
+                recorded,
+                current,
+            )
+        return recorded
+
     async def backfill_embeddings(
         self, *, limit: int = EMBEDDING_BACKFILL_BATCH, reembed: bool = False
     ) -> int:
@@ -393,9 +431,11 @@ class Runtime:
         成功与失败都留痕，便于成本与可用性可见。
 
         可观察性：每轮都记日志说明模式、处理条数、写回条数与未写回的原因（整批不可用
-        是 ``WARNING``，部分条目拿不到向量或写回失败也是 ``WARNING``）。
+        是 ``WARNING``，部分条目拿不到向量或写回失败也是 ``WARNING``）。入口会先核对
+        一次向量模型账本（同维度换模型也会被查出，见 :meth:`check_embedding_model_ledger`）。
         """
         repository = self._require_repository()
+        await self.check_embedding_model_ledger()
         if reembed:
             pending = await repository.list_memories_for_reembedding(limit=limit)
         else:

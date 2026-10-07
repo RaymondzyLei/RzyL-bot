@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from rzyl_core.llm.prompts import RenderedPrompt
+from rzyl_core.llm.prompts import DEFAULT_PROMPT_VERSION, RenderedPrompt
 from rzyl_core.pipeline import (
     PREVIOUS_TAIL_HEADER,
     SequencedMessage,
@@ -54,7 +54,7 @@ def test_render_places_previous_tail_remembered_and_current_window() -> None:
     rendered = window.render()
 
     assert isinstance(rendered, RenderedPrompt)
-    assert rendered.version == "v1"
+    assert rendered.version == DEFAULT_PROMPT_VERSION
     # 三段都在，且边界可见
     assert PREVIOUS_TAIL_HEADER in rendered.user
     assert "上周那份讲义我看过了" in rendered.user

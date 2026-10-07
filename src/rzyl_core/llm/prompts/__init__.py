@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from importlib import resources
 
 #: 本包内可用的全部提示词版本。新增模板文件时同步登记到这里。
-PROMPT_VERSIONS: tuple[str, ...] = ("v1",)
+#: v1 保持原样（已入库条目记着 ``prompt_version=v1``，改它就等于让归因失效）；
+#: v2 把 supersedes 的锚点写法讲清楚——摘要渲染成 ``[#N]``，模型要填不带 ``#`` 的整数。
+PROMPT_VERSIONS: tuple[str, ...] = ("v1", "v2")
 
 #: 未显式指定版本时使用的版本。
-DEFAULT_PROMPT_VERSION = "v1"
+DEFAULT_PROMPT_VERSION = "v2"
 
 #: 用户内容模板里的两个占位符。
 WINDOW_MESSAGES_PLACEHOLDER = "{{window_messages}}"

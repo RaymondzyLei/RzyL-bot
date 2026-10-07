@@ -42,6 +42,7 @@ from rzyl_core.pipeline.extract import (
     cosine_similarity,
     dedupe_hash,
     normalize_statement,
+    normalize_supersedes,
     parse_extraction,
 )
 from rzyl_core.settings import Settings
@@ -158,6 +159,43 @@ def test_parse_accepts_null_occurred_at_and_detail() -> None:
     item = _item(detail=None, occurred_at=None)
 
     assert parse_extraction(json.dumps([item]))[0].occurred_at is None
+
+
+# —— 纯函数：supersedes 归一化 ——
+#
+# 提示词把已记条目锚点渲染成 ``[#N]``，模型照抄 ``"#2"`` 或包成 ``["#2"]`` 是合理
+# 行为；只对这一个字段宽容，避免为格式差异把整窗内容判失败后丢光。
+
+
+def test_normalize_supersedes_accepts_int_str_hash_and_singleton_array() -> None:
+    assert normalize_supersedes(2) == 2
+    assert normalize_supersedes("2") == 2
+    assert normalize_supersedes("#2") == 2
+    assert normalize_supersedes(" #2 ") == 2
+    assert normalize_supersedes([2]) == 2
+    assert normalize_supersedes(["#2"]) == 2
+
+
+def test_normalize_supersedes_maps_absent_to_none() -> None:
+    assert normalize_supersedes(None) is None
+    assert normalize_supersedes([]) is None
+    assert normalize_supersedes("") is None
+
+
+def test_normalize_supersedes_rejects_a_non_numeric_reference() -> None:
+    with pytest.raises(ValueError):
+        normalize_supersedes("#abc")
+
+
+def test_parse_accepts_the_hashed_anchor_forms_the_prompt_renders() -> None:
+    for value in ("#2", "2", 2, [2], ["#2"]):
+        items = parse_extraction(json.dumps([_item(supersedes=value)]))
+        assert items[0].supersedes == 2, value
+
+
+def test_parse_maps_absent_supersedes_to_none() -> None:
+    assert parse_extraction(json.dumps([_item(supersedes=None)]))[0].supersedes is None
+    assert parse_extraction(json.dumps([_item(supersedes=[])]))[0].supersedes is None
 
 
 # —— 纯函数：归一化与相似度 ——
@@ -348,6 +386,87 @@ async def test_timeout_retries_and_then_lands_in_the_dead_letter(repo: Repositor
     calls = await repo.list_llm_calls(purpose="extract")
     assert len(calls) == 2
     assert all(call.success is False and call.tokens_in == 0 for call in calls)
+
+
+# —— 管道：可观测性（丢了什么要看得见，但不改判定语义）——
+
+
+def _nonempty_invalid_reply() -> ChatResult:
+    """有内容、但格式不合法的输出：数组非空，只是类别不在四类里。"""
+    return _reply([_item(category="gossip")])
+
+
+async def test_parse_failure_logs_the_raw_model_output(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """校验失败时把模型原始输出记进 WARNING，丢了什么看得见。"""
+    pipeline = _pipeline(repo, script=[_broken_reply(), _reply([_item()])])
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.pipeline.extract"):
+        outcome = await pipeline.process_window(_window())
+
+    assert outcome.status is WindowStatus.DONE
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("模型今天不想按格式说话" in message for message in warnings)
+
+
+async def test_the_logged_raw_output_is_truncated(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """原始输出可能有几千字，日志里要截断，别把日志刷爆。"""
+    long_text = "坏" * 1200
+    pipeline = _pipeline(
+        repo,
+        script=[
+            ChatResult(text=long_text, usage=ChatUsage(10, 10), model="fake-model"),
+            _reply([_item()]),
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.pipeline.extract"):
+        await pipeline.process_window(_window())
+
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("坏" * 500 in message for message in warnings)
+    assert all("坏" * 1200 not in message for message in warnings)
+
+
+async def test_empty_retry_after_a_content_producing_failure_is_flagged(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """早先尝试产出过非空内容、最终却以空数组结束：窗口行留说明，状态仍是 done。"""
+    pipeline = _pipeline(repo, script=[_nonempty_invalid_reply(), _reply([])])
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.pipeline.extract"):
+        outcome = await pipeline.process_window(_window())
+
+    assert outcome.status is WindowStatus.DONE
+    assert outcome.memory_ids == ()
+    assert outcome.error is not None and "可能有内容被丢弃" in outcome.error
+    window = await repo.get_window(outcome.window_id)
+    assert window is not None
+    # 判定语义不变：空数组仍是正常结束的 done。
+    assert window.status is WindowStatus.DONE
+    # 但窗口行上要留下一句说明，人工能发现这一窗可能丢了东西。
+    assert window.error is not None
+    assert "可能有内容被丢弃" in window.error
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("可能有内容被丢弃" in message for message in warnings)
+
+
+async def test_empty_result_without_a_prior_content_attempt_stays_clean(
+    repo: Repository, caplog: pytest.LogCaptureFixture
+) -> None:
+    """直接返回空数组是正常结果：不告警、窗口行无 error。"""
+    pipeline = _pipeline(repo, script=[_reply([])])
+
+    with caplog.at_level(logging.WARNING, logger="rzyl_core.pipeline.extract"):
+        outcome = await pipeline.process_window(_window())
+
+    assert outcome.status is WindowStatus.DONE
+    window = await repo.get_window(outcome.window_id)
+    assert window is not None and window.status is WindowStatus.DONE and window.error is None
+    assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
 
 
 # —— 管道：写库失败保持可重试 ——
@@ -685,6 +804,51 @@ async def test_supersede_pointing_at_an_unknown_id_is_ignored(repo: Repository) 
     assert outcome.status is WindowStatus.DONE
     memory = await repo.get_memory(outcome.memory_ids[0])
     assert memory is not None and memory.status is MemoryStatus.ACTIVE
+
+
+async def test_supersede_accepts_the_hashed_reference_the_model_copied(
+    repo: Repository,
+) -> None:
+    """真机失败的原样复现：摘要写 ``[#N]``，模型回 ``["#N"]``，必须照常生效。"""
+    old = await repo.add_memory(
+        group_id=111,
+        category=Category.EVENT,
+        statement="实验课改到周三",
+        confidence=0.9,
+        prompt_version="v1",
+        dedupe_hash=dedupe_hash("实验课改到周三"),
+    )
+    window = assemble_window(
+        group_id=111,
+        messages=[
+            WindowMessage(
+                message_id=101,
+                group_id=111,
+                user_id=10001,
+                text="实验课改到周五了",
+                sent_at=BEGIN,
+                nickname="用户1",
+            )
+        ],
+        remembered=[old],
+        prompt_version="v1",
+    )
+    pipeline = _pipeline(
+        repo,
+        script=[
+            _reply(
+                [_item(statement="实验课改到周五下午三点", evidence=[1], supersedes=[f"#{old.id}"])]
+            )
+        ],
+    )
+
+    outcome = await pipeline.process_window(window)
+
+    assert outcome.status is WindowStatus.DONE
+    assert len(outcome.memory_ids) == 1
+    reloaded_old = await repo.get_memory(old.id)
+    assert reloaded_old is not None and reloaded_old.status is MemoryStatus.EXPIRED
+    assert reloaded_old.superseded_by == outcome.memory_ids[0]
 
 
 async def test_process_window_reuses_an_upstream_window_row(repo: Repository) -> None:
